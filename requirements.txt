@@ -1,0 +1,5 @@
+transformers==4.57.3
+qwen-vl-utils
+datasets
+decord
+flash_attn==2.7.4.post1
