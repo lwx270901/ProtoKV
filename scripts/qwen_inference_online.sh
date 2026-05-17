@@ -1,0 +1,20 @@
+CUDA_VISIBLE_DEVICES=0 python qwen_inference_rvs_proto.py   --model_path Qwen/Qwen2.5-VL-7B-Instruct   \
+  --data_path data/rvs/ego/ego4d_oe.json   \
+  --video_root .   \
+  --output_csv outputs/protokv_qwen25_rvs_oomsafe.csv   \
+  --experiment query_delay   \
+  --deltas 0,10   \
+  --max_frames_num 32   \
+  --max_pixels 25088   \
+  --gpu_max_memory_gib 16   \
+  --cpu_max_memory_gib 64   \
+  --block_size 4   \
+  --compress_frame_num 3   \
+  --compression_method prototrack-kv   \
+  --per_frame   \
+  --prototrack_proto_frames 2   \
+  --prototrack_pq_subspaces 8   \
+  --prototrack_pq_codebook_size 16   \
+  --prototrack_pq_kmeans_iters 2   \
+  --prototrack_pq_sample_size 512   \
+  --prototrack_pq_seed 0
