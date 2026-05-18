@@ -1,7 +1,7 @@
-CUDA_VISIBLE_DEVICES=0 python qwen_inference_rvs_proto.py   --model_path Qwen/Qwen2.5-VL-7B-Instruct   \
+CUDA_VISIBLE_DEVICES=0 python qwen_inference_online.py   --model_path Qwen/Qwen2.5-VL-7B-Instruct   \
   --data_path data/rvs/ego/ego4d_oe.json   \
   --video_root .   \
-  --output_csv outputs/protokv_qwen25_rvs_oomsafe.csv   \
+  --output_csv outputs/protokv_qwen25_rvs_ego.csv   \
   --experiment query_delay   \
   --deltas 0,10   \
   --max_frames_num 32   \
