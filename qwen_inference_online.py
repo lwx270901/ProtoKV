@@ -342,6 +342,9 @@ class RVSVideoEval:
         prototrack_pq_kmeans_iters: int = 4,
         prototrack_pq_sample_size: int = 4096,
         prototrack_pq_seed: int = 0,
+        prototrack_decode_top_s: int = 8,
+        prototrack_decode_beam_size: int = 32,
+        prototrack_decode_eps: float = 1e-5,
         gpu_max_memory_gib: float = 18.0,
         cpu_max_memory_gib: float = 64.0,
         verbose: bool = False,
@@ -365,6 +368,9 @@ class RVSVideoEval:
         self.prototrack_pq_kmeans_iters = int(prototrack_pq_kmeans_iters)
         self.prototrack_pq_sample_size = int(prototrack_pq_sample_size)
         self.prototrack_pq_seed = int(prototrack_pq_seed)
+        self.prototrack_decode_top_s = int(prototrack_decode_top_s)
+        self.prototrack_decode_beam_size = int(prototrack_decode_beam_size)
+        self.prototrack_decode_eps = float(prototrack_decode_eps)
         self.gpu_max_memory_gib = float(gpu_max_memory_gib or 0.0)
         self.cpu_max_memory_gib = float(cpu_max_memory_gib or 0.0)
         self.verbose = verbose
@@ -386,7 +392,10 @@ class RVSVideoEval:
                     f"  ProtoTrack residual PQ: subspaces={self.prototrack_pq_subspaces}, "
                     f"codebook_size={self.prototrack_pq_codebook_size}, "
                     f"kmeans_iters={self.prototrack_pq_kmeans_iters}, "
-                    f"sample_size={self.prototrack_pq_sample_size}"
+                    f"sample_size={self.prototrack_pq_sample_size}, "
+                    f"top_s={self.prototrack_decode_top_s}, "
+                    f"beam_size={self.prototrack_decode_beam_size}, "
+                    f"eps={self.prototrack_decode_eps}"
                 )
         else:
             logger.info("  Block processing: disabled")
@@ -945,6 +954,9 @@ class RVSVideoEval:
                             prototrack_pq_kmeans_iters=self.prototrack_pq_kmeans_iters,
                             prototrack_pq_sample_size=self.prototrack_pq_sample_size,
                             prototrack_pq_seed=self.prototrack_pq_seed,
+                            prototrack_decode_top_s=self.prototrack_decode_top_s,
+                            prototrack_decode_beam_size=self.prototrack_decode_beam_size,
+                            prototrack_decode_eps=self.prototrack_decode_eps,
                         )
 
             cur_frame = frame_end
@@ -1077,6 +1089,12 @@ def main() -> None:
                         help="Maximum residual vectors sampled to initialize each residual PQ codebook.")
     parser.add_argument("--prototrack_pq_seed", type=int, default=0,
                         help="Random seed for residual PQ initialization.")
+    parser.add_argument("--prototrack_decode_top_s", type=int, default=8,
+                        help="Number of top-S residual modes decoded per prototype. Paper default: 8. If the cache budget is too small, the cache code falls back to S=1.")
+    parser.add_argument("--prototrack_decode_beam_size", type=int, default=32,
+                        help="Beam size B for DecodeTopSResidualModes. Paper/code default: 32 (=4*S when S=8). Set <=0 to auto-use 4*S.")
+    parser.add_argument("--prototrack_decode_eps", type=float, default=1e-5,
+                        help="Smoothing epsilon for top-S residual-mode decoding.")
     parser.add_argument("--load_dumped", action="store_true")
     parser.add_argument("--cache_dir", type=str, default="cache/qwen_rvs_video_inputs")
 
@@ -1110,6 +1128,9 @@ def main() -> None:
         prototrack_pq_kmeans_iters=args.prototrack_pq_kmeans_iters,
         prototrack_pq_sample_size=args.prototrack_pq_sample_size,
         prototrack_pq_seed=args.prototrack_pq_seed,
+        prototrack_decode_top_s=args.prototrack_decode_top_s,
+        prototrack_decode_beam_size=args.prototrack_decode_beam_size,
+        prototrack_decode_eps=args.prototrack_decode_eps,
         gpu_max_memory_gib=args.gpu_max_memory_gib,
         cpu_max_memory_gib=args.cpu_max_memory_gib,
         verbose=args.verbose,

@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=0 python qwen_inference_ovu_proto.py
+CUDA_VISIBLE_DEVICES=0 python qwen_inference_offline.py
    --model_path Qwen/Qwen2-VL-7B-Instruct \
       --dataset mlvu   \
       --output_dir results/mlvu   \

@@ -45,7 +45,9 @@ class OfflineVideoEval:
                  load_dumped=False, per_frame=False, prototrack_proto_frames=2,
                  prototrack_pq_subspaces=8, prototrack_pq_codebook_size=16,
                  prototrack_pq_kmeans_iters=4, prototrack_pq_sample_size=4096,
-                 prototrack_pq_seed=0, gpu_max_memory_gib=18.0, cpu_max_memory_gib=64.0,
+                 prototrack_pq_seed=0, prototrack_decode_top_s=8,
+                 prototrack_decode_beam_size=32, prototrack_decode_eps=1e-5,
+                 gpu_max_memory_gib=18.0, cpu_max_memory_gib=64.0,
                  verbose=False):
         """
         Initialize OfflineVideoEval class for Qwen2VL inference on video benchmarks
@@ -79,6 +81,9 @@ class OfflineVideoEval:
         self.prototrack_pq_kmeans_iters = int(prototrack_pq_kmeans_iters)
         self.prototrack_pq_sample_size = int(prototrack_pq_sample_size)
         self.prototrack_pq_seed = int(prototrack_pq_seed)
+        self.prototrack_decode_top_s = int(prototrack_decode_top_s)
+        self.prototrack_decode_beam_size = int(prototrack_decode_beam_size)
+        self.prototrack_decode_eps = float(prototrack_decode_eps)
         self.gpu_max_memory_gib = float(gpu_max_memory_gib or 0.0)
         self.cpu_max_memory_gib = float(cpu_max_memory_gib or 0.0)
         self.model = None
@@ -507,6 +512,9 @@ class OfflineVideoEval:
                     prototrack_pq_kmeans_iters=self.prototrack_pq_kmeans_iters,
                     prototrack_pq_sample_size=self.prototrack_pq_sample_size,
                     prototrack_pq_seed=self.prototrack_pq_seed,
+                    prototrack_decode_top_s=self.prototrack_decode_top_s,
+                    prototrack_decode_beam_size=self.prototrack_decode_beam_size,
+                    prototrack_decode_eps=self.prototrack_decode_eps,
                     cuda_timer=None,
                     timing=None,
                 )
@@ -801,7 +809,10 @@ class OfflineVideoEval:
                 "prototrack_pq_codebook_size": self.prototrack_pq_codebook_size,
                 "prototrack_pq_kmeans_iters": self.prototrack_pq_kmeans_iters,
                 "prototrack_pq_sample_size": self.prototrack_pq_sample_size,
-                "prototrack_pq_seed": self.prototrack_pq_seed
+                "prototrack_pq_seed": self.prototrack_pq_seed,
+                "prototrack_decode_top_s": self.prototrack_decode_top_s,
+                "prototrack_decode_beam_size": self.prototrack_decode_beam_size,
+                "prototrack_decode_eps": self.prototrack_decode_eps
             }
         }
         
@@ -872,6 +883,12 @@ def main():
                         help="Residual samples for ProtoKV PQ initialization")
     parser.add_argument("--prototrack_pq_seed", type=int, default=0,
                         help="Random seed for ProtoKV residual PQ")
+    parser.add_argument("--prototrack_decode_top_s", type=int, default=8,
+                        help="Number of decoded top-S residual modes per prototype for Algorithm 3")
+    parser.add_argument("--prototrack_decode_beam_size", type=int, default=32,
+                        help="Beam size B for Algorithm 3. Use 0 to let cache code use B=4S.")
+    parser.add_argument("--prototrack_decode_eps", type=float, default=1e-5,
+                        help="Smoothing epsilon for Algorithm 3 residual-mode probabilities")
     parser.add_argument("--verbose", action="store_true",
                         help="Verbose output")
     args = parser.parse_args()
@@ -895,6 +912,9 @@ def main():
         prototrack_pq_kmeans_iters=args.prototrack_pq_kmeans_iters,
         prototrack_pq_sample_size=args.prototrack_pq_sample_size,
         prototrack_pq_seed=args.prototrack_pq_seed,
+        prototrack_decode_top_s=args.prototrack_decode_top_s,
+        prototrack_decode_beam_size=args.prototrack_decode_beam_size,
+        prototrack_decode_eps=args.prototrack_decode_eps,
         gpu_max_memory_gib=args.gpu_max_memory_gib,
         cpu_max_memory_gib=args.cpu_max_memory_gib,
         verbose=args.verbose
@@ -913,6 +933,8 @@ def main():
             print(f"Block size: {args.block_size}")
             print(f"Compress frames: {args.compress_frame_num}")
             print(f"Compression method: {args.compression_method}")
+            if args.compression_method == "prototrack-kv":
+                print(f"ProtoKV top-S: S={args.prototrack_decode_top_s}, B={args.prototrack_decode_beam_size}, eps={args.prototrack_decode_eps}")
         print(f"\n=== Starting Evaluation ===")
     
     # Run evaluation

@@ -317,6 +317,68 @@ def _pq_expected_residual_from_hist(hist: torch.Tensor, codebooks: torch.Tensor)
     return parts.reshape(H, P, TPF, S_eff * ds)
 
 
+
+
+@torch.no_grad()
+def _pq_decode_top_s_residuals_from_hist(
+    hist: torch.Tensor,
+    codebooks: torch.Tensor,
+    top_s: int = 1,
+    beam_size: Optional[int] = None,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """Decode top-S full PQ residual modes using Algorithm 3 beam search.
+
+    hist:      [H, P, TPF, G, C]
+    codebooks: [G, C, d_g]
+    return:    [H, P, S, TPF, D]
+
+    H[g,c] is treated as a factorized categorical distribution over PQ
+    subquantizers. We keep the top-B partial tuples at each subquantizer and
+    return the top-S full codeword tuples. Empty histograms return zero residuals.
+    """
+    if hist.dim() != 5 or codebooks.dim() != 3:
+        raise ValueError(f"Expected hist [H,P,TPF,G,C] and codebooks [G,C,dg], got {tuple(hist.shape)} and {tuple(codebooks.shape)}")
+    H, P, TPF, G, C = hist.shape
+    Gc, Cc, ds = codebooks.shape
+    if G != Gc or C != Cc:
+        raise ValueError(f"PQ hist/codebook mismatch: hist G,C={(G, C)}, codebook G,C={(Gc, Cc)}")
+
+    S_out = max(1, int(top_s))
+    B = 4 * S_out if beam_size is None or int(beam_size) <= 0 else max(S_out, int(beam_size))
+
+    N = H * P * TPF
+    flat_hist = hist.reshape(N, G, C).float()
+    valid = flat_hist.sum(dim=(1, 2)) > 0
+    probs = (flat_hist + float(eps)) / (flat_hist.sum(dim=-1, keepdim=True) + float(C) * float(eps)).clamp(min=1e-12)
+    logp = torch.log(probs)
+
+    beam_scores = torch.zeros((N, 1), device=hist.device, dtype=torch.float32)
+    beam_codes = torch.empty((N, 1, 0), device=hist.device, dtype=torch.long)
+    for g in range(G):
+        cand = beam_scores.unsqueeze(-1) + logp[:, g, :].unsqueeze(1)  # [N,Bcur,C]
+        flat = cand.reshape(N, -1)
+        keep = min(B, flat.shape[1])
+        beam_scores, top_idx = torch.topk(flat, k=keep, dim=1)
+        prev_beam = top_idx // C
+        new_code = top_idx % C
+        if g == 0:
+            beam_codes = new_code.unsqueeze(-1)
+        else:
+            prev_codes = beam_codes.gather(1, prev_beam.unsqueeze(-1).expand(-1, -1, g))
+            beam_codes = torch.cat([prev_codes, new_code.unsqueeze(-1)], dim=-1)
+
+    take = min(S_out, beam_codes.shape[1])
+    codes = beam_codes[:, :take, :]
+    if take < S_out:
+        codes = torch.cat([codes, codes[:, -1:, :].expand(-1, S_out - take, -1)], dim=1)
+
+    cb = codebooks.float()
+    parts = [cb[g][codes[:, :, g]] for g in range(G)]
+    residual = torch.cat(parts, dim=-1)  # [N,S,D]
+    residual = residual * valid.view(N, 1, 1).to(residual.dtype)
+    return residual.reshape(H, P, TPF, S_out, G * ds).permute(0, 1, 3, 2, 4).contiguous()
+
 @torch.no_grad()
 def _fit_residual_codebooks_from_frames(
     far_k: torch.Tensor,
@@ -540,6 +602,9 @@ def _prototrack_kv_compress_layer(
     pq_hist_k: Optional[torch.Tensor] = None,
     pq_hist_v: Optional[torch.Tensor] = None,
     pq_seed: int = 0,
+    pq_decode_top_s: int = 1,
+    pq_decode_beam_size: int = 0,
+    pq_decode_eps: float = 1e-5,
     # ── NEW: prefer cuda_timer over the legacy timing dict ──────────────
     cuda_timer=None,          # Optional[CudaTimer]
     timing: Optional[Dict[str, float]] = None,
@@ -558,8 +623,13 @@ def _prototrack_kv_compress_layer(
     if cur_frames <= compress_frame_num:
         return key_states_to_compress, value_states_to_compress, state_initialized, int(state_proto_frames_cur), pq_codebook_k, pq_codebook_v
 
-    proto_frames_target = min(proto_frames_max, max(1, compress_frame_num - 1))
-    recent_frames = compress_frame_num - proto_frames_target
+    # Top-S decoding turns each prototype slot into S pseudo-token frames.
+    # Keep the final KV length fixed by reducing prototype slots accordingly.
+    decode_top_s_eff = max(1, int(pq_decode_top_s))
+    if compress_frame_num <= decode_top_s_eff:
+        decode_top_s_eff = 1
+    proto_frames_target = min(proto_frames_max, max(1, (compress_frame_num - 1) // decode_top_s_eff))
+    recent_frames = compress_frame_num - proto_frames_target * decode_top_s_eff
     assert recent_frames >= 1
 
     kf = key_states_to_compress[0].reshape(H, cur_frames, token_per_frame, D)
@@ -699,17 +769,18 @@ def _prototrack_kv_compress_layer(
     # ────────────────────────────────────────────────────────────────────
 
     P_final = min(proto_frames_target, proto_k.shape[1])
-    recent_final = compress_frame_num - P_final
+    recent_final = compress_frame_num - P_final * decode_top_s_eff
     near_k_final = kf[:, cur_frames - recent_final:]
     near_v_final = vf[:, cur_frames - recent_final:]
 
-    # Residual-statistics PQ path.
-    # Earlier versions quantized prototype centers directly.  Here PQ is used as
-    # intended by ProtoKV: fit codebooks on residuals, maintain H_k^K/H_k^V
-    # histograms, then decode the expected residual (S=1) and add it to each
-    # prototype before exposing pseudo-KV tokens to attention.
-    proto_out_k = proto_k[:, :P_final].contiguous()
-    proto_out_v = proto_v[:, :P_final].contiguous()
+    # Algorithm 3 + Algorithm 4 path: decode top-S residual modes and expose
+    # S pseudo-token frames per prototype. Key and Value modes are decoded
+    # separately from H^K/H^V and paired by rank s.
+    proto_center_k = proto_k[:, :P_final].contiguous()
+    proto_center_v = proto_v[:, :P_final].contiguous()
+    proto_modes_k = proto_center_k.unsqueeze(2).expand(-1, -1, decode_top_s_eff, -1, -1).contiguous()
+    proto_modes_v = proto_center_v.unsqueeze(2).expand(-1, -1, decode_top_s_eff, -1, -1).contiguous()
+
     if pq_subspaces and int(pq_subspaces) > 0 and int(pq_codebook_size) > 1 and P_final > 0 and pq_hist_k is not None and pq_hist_v is not None:
         far_frames_for_hist = max(0, near_start)
         far_k_hist = kf[:, :far_frames_for_hist]
@@ -720,36 +791,45 @@ def _prototrack_kv_compress_layer(
         if (pq_codebook_k is None or pq_codebook_v is None) and far_frames_for_hist > 0:
             pq_codebook_k, pq_codebook_v = _fit_residual_codebooks_from_frames(
                 far_k_hist, far_v_hist,
-                proto_k[:, :P_final].contiguous(), proto_v[:, :P_final].contiguous(),
+                proto_center_k, proto_center_v,
                 int(pq_subspaces), int(pq_codebook_size), int(pq_kmeans_iters), int(pq_sample_size), int(pq_seed),
                 rope_theta=rope_theta,
                 far_frame_taus=far_taus_hist,
                 proto_taus=(state_taus[:, :P_final] if use_rope_align else None),
             )
-        # On first initialization, or after a histogram reset, rebuild H from
-        # all available far frames.  Later calls update H incrementally when
-        # exact frames are absorbed into prototypes.
         if pq_codebook_k is not None and pq_codebook_v is not None and far_frames_for_hist > 0 and int(pq_hist_k[:, :P_final].sum().item()) == 0:
             _rebuild_pq_histograms_from_frames(
                 pq_hist_k[:, :P_final], pq_hist_v[:, :P_final],
                 far_k_hist, far_v_hist,
-                proto_k[:, :P_final].contiguous(), proto_v[:, :P_final].contiguous(),
+                proto_center_k, proto_center_v,
                 pq_codebook_k, pq_codebook_v,
                 rope_theta=rope_theta,
                 far_frame_taus=far_taus_hist,
                 proto_taus=(state_taus[:, :P_final] if use_rope_align else None),
             )
         if pq_codebook_k is not None and pq_codebook_v is not None:
-            rK_exp = _pq_expected_residual_from_hist(pq_hist_k[:, :P_final], pq_codebook_k).to(proto_out_k.dtype)
-            rV_exp = _pq_expected_residual_from_hist(pq_hist_v[:, :P_final], pq_codebook_v).to(proto_out_v.dtype)
-            if rK_exp.shape == proto_out_k.shape:
-                proto_out_k = proto_out_k + rK_exp
-            if rV_exp.shape == proto_out_v.shape:
-                proto_out_v = proto_out_v + rV_exp
+            rK_modes = _pq_decode_top_s_residuals_from_hist(
+                pq_hist_k[:, :P_final], pq_codebook_k,
+                top_s=decode_top_s_eff,
+                beam_size=int(pq_decode_beam_size),
+                eps=float(pq_decode_eps),
+            ).to(proto_center_k.dtype)
+            rV_modes = _pq_decode_top_s_residuals_from_hist(
+                pq_hist_v[:, :P_final], pq_codebook_v,
+                top_s=decode_top_s_eff,
+                beam_size=int(pq_decode_beam_size),
+                eps=float(pq_decode_eps),
+            ).to(proto_center_v.dtype)
+            if rK_modes.shape == proto_modes_k.shape:
+                proto_modes_k = proto_center_k.unsqueeze(2) + rK_modes
+            if rV_modes.shape == proto_modes_v.shape:
+                proto_modes_v = proto_center_v.unsqueeze(2) + rV_modes
 
+    proto_out_k = proto_modes_k.reshape(H, P_final * decode_top_s_eff, token_per_frame, D)
+    proto_out_v = proto_modes_v.reshape(H, P_final * decode_top_s_eff, token_per_frame, D)
     new_kf = torch.cat([proto_out_k, near_k_final], dim=1)
     new_vf = torch.cat([proto_out_v, near_v_final], dim=1)
-    assert new_kf.shape[1] == compress_frame_num
+    assert new_kf.shape[1] == compress_frame_num, (new_kf.shape[1], compress_frame_num, P_final, decode_top_s_eff, recent_final)
     new_k = new_kf.reshape(1, H, compress_frame_num * token_per_frame, D)
     new_v = new_vf.reshape(1, H, compress_frame_num * token_per_frame, D)
     return new_k, new_v, state_initialized, P_final, pq_codebook_k, pq_codebook_v
@@ -802,6 +882,9 @@ def process_kv_cache(
     prototrack_pq_kmeans_iters: int = 4,
     prototrack_pq_sample_size: int = 4096,
     prototrack_pq_seed: int = 0,
+    prototrack_decode_top_s: int = 1,
+    prototrack_decode_beam_size: int = 0,
+    prototrack_decode_eps: float = 1e-5,
     # ── NEW: CUDA event timer (preferred over legacy timing dict) ────────
     cuda_timer=None,          # Optional[CudaTimer]
     timing: Optional[Dict[str, float]] = None,
@@ -903,6 +986,9 @@ def process_kv_cache(
                 pq_hist_k=hist_k_layer,
                 pq_hist_v=hist_v_layer,
                 pq_seed=int(prototrack_pq_seed + layer_idx * 101),
+                pq_decode_top_s=int(prototrack_decode_top_s),
+                pq_decode_beam_size=int(prototrack_decode_beam_size),
+                pq_decode_eps=float(prototrack_decode_eps),
                 # ── pass timer into compress layer ───────────────────────
                 cuda_timer=cuda_timer,
                 timing=timing if cuda_timer is None else None,
