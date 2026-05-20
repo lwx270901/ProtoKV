@@ -1,10 +1,3 @@
-"""qwen_rvs_video.py
-
-RVS / StreamingVQA inference with Qwen-VL and ProtoKV cache compression.
-The external CUDA timing logger has been removed; the script now writes only
-the prediction CSV requested by --output_csv.
-"""
-
 from __future__ import annotations
 
 import argparse

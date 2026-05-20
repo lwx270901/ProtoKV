@@ -1,18 +1,3 @@
-"""kvcache_utils_proto.py  (CUDA-event timing patch)
-
-Changes vs. original
----------------------
-*  ``process_kv_cache`` accepts a new optional ``cuda_timer`` kwarg
-   (a :class:`~cuda_timing.CudaTimer` instance).
-*  The ``proto_update`` region inside ``_prototrack_kv_compress_layer``
-   is now measured with a ``torch.cuda.Event`` pair when ``cuda_timer``
-   is provided, falling back to the original CPU dict when it is not.
-*  The legacy ``timing`` dict parameter is kept for backwards compat but
-   is only used when ``cuda_timer`` is None.
-
-All other logic is identical to the original file.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass

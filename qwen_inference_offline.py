@@ -1,11 +1,3 @@
-"""
-Qwen2-VL Inference with Integrated Vision-LLM Block Processing
-
-This module integrates vision encoding and LLM block processing:
-- Instead of encoding all video frames at once, we process them block by block
-- Each block: Vision Tower (partial frames) -> Vision Tokens -> LLM Forward -> KV Compression
-"""
-
 import os
 import json
 import torch
