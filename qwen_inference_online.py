@@ -1,3 +1,10 @@
+"""qwen_rvs_video.py
+
+RVS / StreamingVQA inference with Qwen-VL and ProtoKV cache compression.
+The external CUDA timing logger has been removed; the script now writes only
+the prediction CSV requested by --output_csv.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -27,7 +34,7 @@ from transformers import (
     Qwen2_5_VLForConditionalGeneration,
 )
 
-from kvcache_utils_proto import process_kv_cache
+from kvcache_utils_proto import process_kv_cache, install_protokv_attention_bias_hook
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -335,9 +342,20 @@ class RVSVideoEval:
         prototrack_pq_kmeans_iters: int = 4,
         prototrack_pq_sample_size: int = 4096,
         prototrack_pq_seed: int = 0,
-        prototrack_decode_top_s: int = 8,
-        prototrack_decode_beam_size: int = 32,
-        prototrack_decode_eps: float = 1e-5,
+        prototrack_pq_modes: int = 8,
+        prototrack_pq_beam_size: int = 0,
+        prototrack_pq_beam_eps: float = 1e-5,
+        prototrack_lambda_sp: float = 0.1,
+        prototrack_lambda_idle: float = 0.01,
+        prototrack_idle_threshold: int = 120,
+        prototrack_alpha: float = 0.05,
+        prototrack_beta: float = 0.05,
+        prototrack_eta: float = 0.05,
+        prototrack_maintenance_gamma: float = 0.05,
+        prototrack_merge_eps_k: float = 0.20,
+        prototrack_merge_eps_v: float = 0.25,
+        prototrack_min_mass: float = 1.0,
+        attn_implementation: str = "eager",
         gpu_max_memory_gib: float = 18.0,
         cpu_max_memory_gib: float = 64.0,
         verbose: bool = False,
@@ -361,9 +379,20 @@ class RVSVideoEval:
         self.prototrack_pq_kmeans_iters = int(prototrack_pq_kmeans_iters)
         self.prototrack_pq_sample_size = int(prototrack_pq_sample_size)
         self.prototrack_pq_seed = int(prototrack_pq_seed)
-        self.prototrack_decode_top_s = int(prototrack_decode_top_s)
-        self.prototrack_decode_beam_size = int(prototrack_decode_beam_size)
-        self.prototrack_decode_eps = float(prototrack_decode_eps)
+        self.prototrack_pq_modes = int(prototrack_pq_modes)
+        self.prototrack_pq_beam_size = int(prototrack_pq_beam_size)
+        self.prototrack_pq_beam_eps = float(prototrack_pq_beam_eps)
+        self.prototrack_lambda_sp = float(prototrack_lambda_sp)
+        self.prototrack_lambda_idle = float(prototrack_lambda_idle)
+        self.prototrack_idle_threshold = int(prototrack_idle_threshold)
+        self.prototrack_alpha = float(prototrack_alpha)
+        self.prototrack_beta = float(prototrack_beta)
+        self.prototrack_eta = float(prototrack_eta)
+        self.prototrack_maintenance_gamma = float(prototrack_maintenance_gamma)
+        self.prototrack_merge_eps_k = float(prototrack_merge_eps_k)
+        self.prototrack_merge_eps_v = float(prototrack_merge_eps_v)
+        self.prototrack_min_mass = float(prototrack_min_mass)
+        self.attn_implementation = str(attn_implementation)
         self.gpu_max_memory_gib = float(gpu_max_memory_gib or 0.0)
         self.cpu_max_memory_gib = float(cpu_max_memory_gib or 0.0)
         self.verbose = verbose
@@ -386,9 +415,12 @@ class RVSVideoEval:
                     f"codebook_size={self.prototrack_pq_codebook_size}, "
                     f"kmeans_iters={self.prototrack_pq_kmeans_iters}, "
                     f"sample_size={self.prototrack_pq_sample_size}, "
-                    f"top_s={self.prototrack_decode_top_s}, "
-                    f"beam_size={self.prototrack_decode_beam_size}, "
-                    f"eps={self.prototrack_decode_eps}"
+                    f"S={self.prototrack_pq_modes}, B={self.prototrack_pq_beam_size or 4 * self.prototrack_pq_modes}"
+                )
+                logger.info(
+                    f"  ProtoKV paper EMA/assign: alpha={self.prototrack_alpha}, beta={self.prototrack_beta}, "
+                    f"eta={self.prototrack_eta}, lambda_sp={self.prototrack_lambda_sp}, "
+                    f"lambda_idle={self.prototrack_lambda_idle}, T_idle={self.prototrack_idle_threshold}"
                 )
         else:
             logger.info("  Block processing: disabled")
@@ -421,7 +453,7 @@ class RVSVideoEval:
             # accidentally allocating fp32 tensors in some Transformers versions.
             torch_dtype=torch.bfloat16,
             device_map="auto",
-            attn_implementation="flash_attention_2",
+            attn_implementation=self.attn_implementation,
         )
         if max_memory is not None:
             load_kwargs["max_memory"] = max_memory
@@ -438,6 +470,9 @@ class RVSVideoEval:
             )
         self.processor = AutoProcessor.from_pretrained(self.model_path)
         self._print("Model loaded.")
+        if self.compression_method == "prototrack-kv":
+            install_protokv_attention_bias_hook(self.model)
+            logger.info(f"ProtoKV bias-aware attention hook installed; attn_implementation={self.attn_implementation}")
         logger.info("Model and processor loaded successfully")
         try:
             self.model.eval()
@@ -947,9 +982,19 @@ class RVSVideoEval:
                             prototrack_pq_kmeans_iters=self.prototrack_pq_kmeans_iters,
                             prototrack_pq_sample_size=self.prototrack_pq_sample_size,
                             prototrack_pq_seed=self.prototrack_pq_seed,
-                            prototrack_decode_top_s=self.prototrack_decode_top_s,
-                            prototrack_decode_beam_size=self.prototrack_decode_beam_size,
-                            prototrack_decode_eps=self.prototrack_decode_eps,
+                            prototrack_pq_modes=self.prototrack_pq_modes,
+                            prototrack_pq_beam_size=self.prototrack_pq_beam_size,
+                            prototrack_pq_beam_eps=self.prototrack_pq_beam_eps,
+                            prototrack_lambda_sp=self.prototrack_lambda_sp,
+                            prototrack_lambda_idle=self.prototrack_lambda_idle,
+                            prototrack_idle_threshold=self.prototrack_idle_threshold,
+                            prototrack_alpha=self.prototrack_alpha,
+                            prototrack_beta=self.prototrack_beta,
+                            prototrack_eta=self.prototrack_eta,
+                            prototrack_maintenance_gamma=self.prototrack_maintenance_gamma,
+                            prototrack_merge_eps_k=self.prototrack_merge_eps_k,
+                            prototrack_merge_eps_v=self.prototrack_merge_eps_v,
+                            prototrack_min_mass=self.prototrack_min_mass,
                         )
 
             cur_frame = frame_end
@@ -1082,12 +1127,25 @@ def main() -> None:
                         help="Maximum residual vectors sampled to initialize each residual PQ codebook.")
     parser.add_argument("--prototrack_pq_seed", type=int, default=0,
                         help="Random seed for residual PQ initialization.")
-    parser.add_argument("--prototrack_decode_top_s", type=int, default=8,
-                        help="Number of top-S residual modes decoded per prototype. Paper default: 8. If the cache budget is too small, the cache code falls back to S=1.")
-    parser.add_argument("--prototrack_decode_beam_size", type=int, default=32,
-                        help="Beam size B for DecodeTopSResidualModes. Paper/code default: 32 (=4*S when S=8). Set <=0 to auto-use 4*S.")
-    parser.add_argument("--prototrack_decode_eps", type=float, default=1e-5,
-                        help="Smoothing epsilon for top-S residual-mode decoding.")
+    parser.add_argument("--prototrack_pq_modes", type=int, default=8,
+                        help="S: number of top-S residual modes / pseudo-token groups per prototype. Paper default: 8.")
+    parser.add_argument("--prototrack_pq_beam_size", type=int, default=0,
+                        help="B: beam size for DecodeTopSResidualModes. If 0, use B=4S. Paper default with S=8: 32.")
+    parser.add_argument("--prototrack_pq_beam_eps", type=float, default=1e-5,
+                        help="Epsilon smoothing for PQ histogram decoding.")
+    parser.add_argument("--prototrack_lambda_sp", type=float, default=0.1)
+    parser.add_argument("--prototrack_lambda_idle", type=float, default=0.01)
+    parser.add_argument("--prototrack_idle_threshold", type=int, default=120)
+    parser.add_argument("--prototrack_alpha", type=float, default=0.05)
+    parser.add_argument("--prototrack_beta", type=float, default=0.05)
+    parser.add_argument("--prototrack_eta", type=float, default=0.05)
+    parser.add_argument("--prototrack_maintenance_gamma", type=float, default=0.05)
+    parser.add_argument("--prototrack_merge_eps_k", type=float, default=0.20)
+    parser.add_argument("--prototrack_merge_eps_v", type=float, default=0.25)
+    parser.add_argument("--prototrack_min_mass", type=float, default=1.0)
+    parser.add_argument("--attn_implementation", type=str, default="eager",
+                        choices=["eager", "sdpa", "flash_attention_2"],
+                        help="Use eager for exact ProtoKV log-mass bias. FlashAttention2 may ignore arbitrary positive additive bias.")
     parser.add_argument("--load_dumped", action="store_true")
     parser.add_argument("--cache_dir", type=str, default="cache/qwen_rvs_video_inputs")
 
@@ -1121,9 +1179,20 @@ def main() -> None:
         prototrack_pq_kmeans_iters=args.prototrack_pq_kmeans_iters,
         prototrack_pq_sample_size=args.prototrack_pq_sample_size,
         prototrack_pq_seed=args.prototrack_pq_seed,
-        prototrack_decode_top_s=args.prototrack_decode_top_s,
-        prototrack_decode_beam_size=args.prototrack_decode_beam_size,
-        prototrack_decode_eps=args.prototrack_decode_eps,
+        prototrack_pq_modes=args.prototrack_pq_modes,
+        prototrack_pq_beam_size=args.prototrack_pq_beam_size,
+        prototrack_pq_beam_eps=args.prototrack_pq_beam_eps,
+        prototrack_lambda_sp=args.prototrack_lambda_sp,
+        prototrack_lambda_idle=args.prototrack_lambda_idle,
+        prototrack_idle_threshold=args.prototrack_idle_threshold,
+        prototrack_alpha=args.prototrack_alpha,
+        prototrack_beta=args.prototrack_beta,
+        prototrack_eta=args.prototrack_eta,
+        prototrack_maintenance_gamma=args.prototrack_maintenance_gamma,
+        prototrack_merge_eps_k=args.prototrack_merge_eps_k,
+        prototrack_merge_eps_v=args.prototrack_merge_eps_v,
+        prototrack_min_mass=args.prototrack_min_mass,
+        attn_implementation=args.attn_implementation,
         gpu_max_memory_gib=args.gpu_max_memory_gib,
         cpu_max_memory_gib=args.cpu_max_memory_gib,
         verbose=args.verbose,

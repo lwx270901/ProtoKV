@@ -13,7 +13,7 @@ from qwen_vl_utils import process_vision_info
 import argparse
 
 # Import utilities
-from kvcache_utils_proto import process_kv_cache
+from kvcache_utils_proto import process_kv_cache, install_protokv_attention_bias_hook
 from dataset_utils import EvalDataset, format_question, extract_answer, get_default_data_path
 
 
@@ -37,8 +37,14 @@ class OfflineVideoEval:
                  load_dumped=False, per_frame=False, prototrack_proto_frames=2,
                  prototrack_pq_subspaces=8, prototrack_pq_codebook_size=16,
                  prototrack_pq_kmeans_iters=4, prototrack_pq_sample_size=4096,
-                 prototrack_pq_seed=0, prototrack_decode_top_s=8,
-                 prototrack_decode_beam_size=32, prototrack_decode_eps=1e-5,
+                 prototrack_pq_seed=0, prototrack_pq_modes=8,
+                 prototrack_pq_beam_size=0, prototrack_pq_beam_eps=1e-5,
+                 prototrack_lambda_sp=0.1, prototrack_lambda_idle=0.01,
+                 prototrack_idle_threshold=120, prototrack_alpha=0.05,
+                 prototrack_beta=0.05, prototrack_eta=0.05,
+                 prototrack_maintenance_gamma=0.05,
+                 prototrack_merge_eps_k=0.20, prototrack_merge_eps_v=0.25,
+                 prototrack_min_mass=1.0, attn_implementation="eager",
                  gpu_max_memory_gib=18.0, cpu_max_memory_gib=64.0,
                  verbose=False):
         """
@@ -73,9 +79,20 @@ class OfflineVideoEval:
         self.prototrack_pq_kmeans_iters = int(prototrack_pq_kmeans_iters)
         self.prototrack_pq_sample_size = int(prototrack_pq_sample_size)
         self.prototrack_pq_seed = int(prototrack_pq_seed)
-        self.prototrack_decode_top_s = int(prototrack_decode_top_s)
-        self.prototrack_decode_beam_size = int(prototrack_decode_beam_size)
-        self.prototrack_decode_eps = float(prototrack_decode_eps)
+        self.prototrack_pq_modes = int(prototrack_pq_modes)
+        self.prototrack_pq_beam_size = int(prototrack_pq_beam_size)
+        self.prototrack_pq_beam_eps = float(prototrack_pq_beam_eps)
+        self.prototrack_lambda_sp = float(prototrack_lambda_sp)
+        self.prototrack_lambda_idle = float(prototrack_lambda_idle)
+        self.prototrack_idle_threshold = int(prototrack_idle_threshold)
+        self.prototrack_alpha = float(prototrack_alpha)
+        self.prototrack_beta = float(prototrack_beta)
+        self.prototrack_eta = float(prototrack_eta)
+        self.prototrack_maintenance_gamma = float(prototrack_maintenance_gamma)
+        self.prototrack_merge_eps_k = float(prototrack_merge_eps_k)
+        self.prototrack_merge_eps_v = float(prototrack_merge_eps_v)
+        self.prototrack_min_mass = float(prototrack_min_mass)
+        self.attn_implementation = str(attn_implementation)
         self.gpu_max_memory_gib = float(gpu_max_memory_gib or 0.0)
         self.cpu_max_memory_gib = float(cpu_max_memory_gib or 0.0)
         self.model = None
@@ -150,7 +167,7 @@ class OfflineVideoEval:
         load_kwargs = dict(
             torch_dtype=torch.bfloat16,
             device_map="auto",
-            attn_implementation="flash_attention_2",
+            attn_implementation=self.attn_implementation,
         )
         if max_memory is not None:
             load_kwargs["max_memory"] = max_memory
@@ -165,6 +182,9 @@ class OfflineVideoEval:
             )
 
         self.processor = AutoProcessor.from_pretrained(self.model_path)
+        if self.compression_method == "prototrack-kv":
+            install_protokv_attention_bias_hook(self.model)
+            self._print(f"ProtoKV bias-aware attention hook installed; attn_implementation={self.attn_implementation}")
         try:
             self.model.eval()
         except Exception:
@@ -504,9 +524,19 @@ class OfflineVideoEval:
                     prototrack_pq_kmeans_iters=self.prototrack_pq_kmeans_iters,
                     prototrack_pq_sample_size=self.prototrack_pq_sample_size,
                     prototrack_pq_seed=self.prototrack_pq_seed,
-                    prototrack_decode_top_s=self.prototrack_decode_top_s,
-                    prototrack_decode_beam_size=self.prototrack_decode_beam_size,
-                    prototrack_decode_eps=self.prototrack_decode_eps,
+                    prototrack_pq_modes=self.prototrack_pq_modes,
+                    prototrack_pq_beam_size=self.prototrack_pq_beam_size,
+                    prototrack_pq_beam_eps=self.prototrack_pq_beam_eps,
+                    prototrack_lambda_sp=self.prototrack_lambda_sp,
+                    prototrack_lambda_idle=self.prototrack_lambda_idle,
+                    prototrack_idle_threshold=self.prototrack_idle_threshold,
+                    prototrack_alpha=self.prototrack_alpha,
+                    prototrack_beta=self.prototrack_beta,
+                    prototrack_eta=self.prototrack_eta,
+                    prototrack_maintenance_gamma=self.prototrack_maintenance_gamma,
+                    prototrack_merge_eps_k=self.prototrack_merge_eps_k,
+                    prototrack_merge_eps_v=self.prototrack_merge_eps_v,
+                    prototrack_min_mass=self.prototrack_min_mass,
                     cuda_timer=None,
                     timing=None,
                 )
@@ -802,9 +832,20 @@ class OfflineVideoEval:
                 "prototrack_pq_kmeans_iters": self.prototrack_pq_kmeans_iters,
                 "prototrack_pq_sample_size": self.prototrack_pq_sample_size,
                 "prototrack_pq_seed": self.prototrack_pq_seed,
-                "prototrack_decode_top_s": self.prototrack_decode_top_s,
-                "prototrack_decode_beam_size": self.prototrack_decode_beam_size,
-                "prototrack_decode_eps": self.prototrack_decode_eps
+                "prototrack_pq_modes": self.prototrack_pq_modes,
+                "prototrack_pq_beam_size": self.prototrack_pq_beam_size,
+                "prototrack_pq_beam_eps": self.prototrack_pq_beam_eps,
+                "prototrack_lambda_sp": self.prototrack_lambda_sp,
+                "prototrack_lambda_idle": self.prototrack_lambda_idle,
+                "prototrack_idle_threshold": self.prototrack_idle_threshold,
+                "prototrack_alpha": self.prototrack_alpha,
+                "prototrack_beta": self.prototrack_beta,
+                "prototrack_eta": self.prototrack_eta,
+                "prototrack_maintenance_gamma": self.prototrack_maintenance_gamma,
+                "prototrack_merge_eps_k": self.prototrack_merge_eps_k,
+                "prototrack_merge_eps_v": self.prototrack_merge_eps_v,
+                "prototrack_min_mass": self.prototrack_min_mass,
+                "attn_implementation": self.attn_implementation
             }
         }
         
@@ -875,12 +916,35 @@ def main():
                         help="Residual samples for ProtoKV PQ initialization")
     parser.add_argument("--prototrack_pq_seed", type=int, default=0,
                         help="Random seed for ProtoKV residual PQ")
-    parser.add_argument("--prototrack_decode_top_s", type=int, default=8,
-                        help="Number of decoded top-S residual modes per prototype for Algorithm 3")
-    parser.add_argument("--prototrack_decode_beam_size", type=int, default=32,
-                        help="Beam size B for Algorithm 3. Use 0 to let cache code use B=4S.")
-    parser.add_argument("--prototrack_decode_eps", type=float, default=1e-5,
-                        help="Smoothing epsilon for Algorithm 3 residual-mode probabilities")
+    parser.add_argument("--prototrack_pq_modes", type=int, default=8,
+                        help="S: number of top-S residual modes / pseudo-token groups per prototype. Paper default: 8.")
+    parser.add_argument("--prototrack_pq_beam_size", type=int, default=0,
+                        help="B: beam size for DecodeTopSResidualModes. If 0, use B=4S. Paper default with S=8: 32.")
+    parser.add_argument("--prototrack_pq_beam_eps", type=float, default=1e-5,
+                        help="Epsilon smoothing for PQ histogram decoding.")
+    parser.add_argument("--prototrack_lambda_sp", type=float, default=0.1,
+                        help="Spatial Mahalanobis assignment weight. Paper default: 0.1.")
+    parser.add_argument("--prototrack_lambda_idle", type=float, default=0.01,
+                        help="Idle/staleness assignment penalty. Paper default: 0.01.")
+    parser.add_argument("--prototrack_idle_threshold", type=int, default=120,
+                        help="Idle threshold T_idle for assignment and maintenance. Paper default: 120.")
+    parser.add_argument("--prototrack_alpha", type=float, default=0.05,
+                        help="EMA rate for prototype key centers. Paper default: 0.05.")
+    parser.add_argument("--prototrack_beta", type=float, default=0.05,
+                        help="EMA rate for prototype value centers. Paper default: 0.05.")
+    parser.add_argument("--prototrack_eta", type=float, default=0.05,
+                        help="EMA rate for spatial statistics. Paper default: 0.05.")
+    parser.add_argument("--prototrack_maintenance_gamma", type=float, default=0.05,
+                        help="Idle mass decay factor for prototype maintenance. Paper default: 0.05.")
+    parser.add_argument("--prototrack_merge_eps_k", type=float, default=0.20,
+                        help="Key-center merge threshold epsilon_K. Paper default: 0.20.")
+    parser.add_argument("--prototrack_merge_eps_v", type=float, default=0.25,
+                        help="Value-center merge threshold epsilon_V. Paper default: 0.25.")
+    parser.add_argument("--prototrack_min_mass", type=float, default=1.0,
+                        help="Minimum prototype mass before reseeding. Paper default: 1.")
+    parser.add_argument("--attn_implementation", type=str, default="eager",
+                        choices=["eager", "sdpa", "flash_attention_2"],
+                        help="Use eager for exact ProtoKV log-mass bias. FlashAttention2 may ignore arbitrary additive bias.")
     parser.add_argument("--verbose", action="store_true",
                         help="Verbose output")
     args = parser.parse_args()
@@ -904,9 +968,20 @@ def main():
         prototrack_pq_kmeans_iters=args.prototrack_pq_kmeans_iters,
         prototrack_pq_sample_size=args.prototrack_pq_sample_size,
         prototrack_pq_seed=args.prototrack_pq_seed,
-        prototrack_decode_top_s=args.prototrack_decode_top_s,
-        prototrack_decode_beam_size=args.prototrack_decode_beam_size,
-        prototrack_decode_eps=args.prototrack_decode_eps,
+        prototrack_pq_modes=args.prototrack_pq_modes,
+        prototrack_pq_beam_size=args.prototrack_pq_beam_size,
+        prototrack_pq_beam_eps=args.prototrack_pq_beam_eps,
+        prototrack_lambda_sp=args.prototrack_lambda_sp,
+        prototrack_lambda_idle=args.prototrack_lambda_idle,
+        prototrack_idle_threshold=args.prototrack_idle_threshold,
+        prototrack_alpha=args.prototrack_alpha,
+        prototrack_beta=args.prototrack_beta,
+        prototrack_eta=args.prototrack_eta,
+        prototrack_maintenance_gamma=args.prototrack_maintenance_gamma,
+        prototrack_merge_eps_k=args.prototrack_merge_eps_k,
+        prototrack_merge_eps_v=args.prototrack_merge_eps_v,
+        prototrack_min_mass=args.prototrack_min_mass,
+        attn_implementation=args.attn_implementation,
         gpu_max_memory_gib=args.gpu_max_memory_gib,
         cpu_max_memory_gib=args.cpu_max_memory_gib,
         verbose=args.verbose
@@ -926,7 +1001,10 @@ def main():
             print(f"Compress frames: {args.compress_frame_num}")
             print(f"Compression method: {args.compression_method}")
             if args.compression_method == "prototrack-kv":
-                print(f"ProtoKV top-S: S={args.prototrack_decode_top_s}, B={args.prototrack_decode_beam_size}, eps={args.prototrack_decode_eps}")
+                print(f"ProtoKV top-S: S={args.prototrack_pq_modes}, B={args.prototrack_pq_beam_size or 4 * args.prototrack_pq_modes}, eps={args.prototrack_pq_beam_eps}")
+                print(f"ProtoKV paper params: lambda_sp={args.prototrack_lambda_sp}, lambda_idle={args.prototrack_lambda_idle}, T_idle={args.prototrack_idle_threshold}")
+                print(f"ProtoKV EMA: alpha={args.prototrack_alpha}, beta={args.prototrack_beta}, eta={args.prototrack_eta}; maintenance gamma={args.prototrack_maintenance_gamma}")
+                print(f"Attention implementation: {args.attn_implementation}")
         print(f"\n=== Starting Evaluation ===")
     
     # Run evaluation
