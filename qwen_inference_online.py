@@ -1,10 +1,3 @@
-"""qwen_rvs_video.py
-
-RVS / StreamingVQA inference with Qwen-VL and ProtoKV cache compression.
-The external CUDA timing logger has been removed; the script now writes only
-the prediction CSV requested by --output_csv.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -1207,10 +1200,13 @@ def main() -> None:
     except Exception as e:
         raise ValueError(f"Failed to parse --deltas='{args.deltas}'.") from e
 
-    fieldnames_standard = ["video_id", "question", "answer", "pred_answer"]
-    fieldnames_delay = ["video_id", "question", "answer", "pred_answer",
-                        "answer_type", "delta", "ttft_ms", "e2e_ms"]
-    fieldnames = fieldnames_delay if args.experiment == "query_delay" else fieldnames_standard
+    # Keep one consistent schema for both standard and query-delay outputs so
+    # the GPT/Open-ended evaluator can consume this file directly.
+    # Latencies are stored in seconds, matching the reference CSV format.
+    fieldnames = [
+        "video_id", "question", "answer", "pred_answer",
+        "answer_type", "delta", "ttft", "e2e",
+    ]
 
     with open(args.output_csv, "w", newline="", encoding="utf-8") as out_f:
         writer = csv.DictWriter(out_f, fieldnames=fieldnames, quoting=csv.QUOTE_MINIMAL)
@@ -1243,15 +1239,28 @@ def main() -> None:
                         and (frame_count > evaluator.block_size or (evaluator.per_frame and frame_count > 1))
                     )
                     response = evaluator.block_process(inputs) if use_block else evaluator.generate(inputs)
+                    total_wall_s = time.perf_counter() - wall_start
                     writer.writerow({
-                        "video_id": s.video_id, "question": s.question,
-                        "answer": s.answer, "pred_answer": (response or "").strip(),
+                        "video_id": s.video_id,
+                        "question": s.question,
+                        "answer": s.answer,
+                        "pred_answer": (response or "").strip(),
+                        "answer_type": s.answer_type,
+                        "delta": "0.0",
+                        "ttft": "",
+                        "e2e": f"{total_wall_s:.10f}",
                     })
                 except Exception as e:
                     logger.exception(f"Error for video_id={s.video_id}: {e}")
                     writer.writerow({
-                        "video_id": s.video_id, "question": s.question,
-                        "answer": s.answer, "pred_answer": "",
+                        "video_id": s.video_id,
+                        "question": s.question,
+                        "answer": s.answer,
+                        "pred_answer": "",
+                        "answer_type": s.answer_type,
+                        "delta": "0.0",
+                        "ttft": "",
+                        "e2e": "",
                     })
                 finally:
                     if torch.cuda.is_available():
@@ -1295,18 +1304,26 @@ def main() -> None:
                     pred, ttft_ms, e2e_ms = evaluator.answer_from_prefill(inputs, past_kv, pos_full)
 
                     writer.writerow({
-                        "video_id": s.video_id, "question": s.question,
-                        "answer": s.answer, "pred_answer": (pred or "").strip(),
-                        "answer_type": s.answer_type, "delta": delta_min,
-                        "ttft_ms": f"{ttft_ms:.3f}", "e2e_ms": f"{e2e_ms:.3f}",
+                        "video_id": s.video_id,
+                        "question": s.question,
+                        "answer": s.answer,
+                        "pred_answer": (pred or "").strip(),
+                        "answer_type": s.answer_type,
+                        "delta": str(float(delta_min)),
+                        "ttft": "" if not math.isfinite(ttft_ms) else f"{ttft_ms / 1000.0:.6f}",
+                        "e2e": "" if not math.isfinite(e2e_ms) else f"{e2e_ms / 1000.0:.6f}",
                     })
                 except Exception as e:
                     logger.exception(f"Error for video_id={s.video_id} delta={delta_min}: {e}")
                     writer.writerow({
-                        "video_id": s.video_id, "question": s.question,
-                        "answer": s.answer, "pred_answer": "",
-                        "answer_type": s.answer_type, "delta": delta_min,
-                        "ttft_ms": "", "e2e_ms": "",
+                        "video_id": s.video_id,
+                        "question": s.question,
+                        "answer": s.answer,
+                        "pred_answer": "",
+                        "answer_type": s.answer_type,
+                        "delta": str(float(delta_min)),
+                        "ttft": "",
+                        "e2e": "",
                     })
                 finally:
                     if torch.cuda.is_available():
