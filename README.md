@@ -11,13 +11,48 @@ Tested with `torch==2.8` and CUDA 12.6 environment.
 
 ---
 
+## Preparation
+
+- Download benchmarks under `data/`
+  - [MLVU-dev-mc](https://huggingface.co/datasets/MLVU/MVLU)
+  - [RVS](https://huggingface.co/datasets/Becomebright/RVS)
+  - The `data/` folder should be arranged as:
+    ```
+    data
+    ├── mlvu
+    │   ├── dev_debug_mc.json
+    │   └── videos
+    ├── streamingbench
+    │   ├── questions_real_stream.json
+    │   └── data/
+    ├── ovo_bench
+    │   ├── ovo_bench_new.json
+    │   └── src_videos
+    └── rvs
+        ├── ego
+        │   ├── ego4d_oe.json
+        │   └── videos
+        └── movie
+            ├── movienet_oe.json
+            └── videos
+    ```
+
 ## Evaluation on online benchmark
 
+-RVS
+```bash
+bash scripts/qwen_inference_online.sh 
+```
+-OVO
+```bash
+bash scripts/qwen_inference_online.sh 
+```
+-StreammingBench
 ```bash
 bash scripts/qwen_inference_online.sh 
 ```
 
-## Evaluation on offline benchmark
+## Evaluation on MLVU (offline benchmark)
 
 ```bash
 bash scripts/qwen_inference_online.sh 
