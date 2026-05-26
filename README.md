@@ -42,7 +42,9 @@ Tested with `torch==2.8` and CUDA 12.6 environment.
 -RVS
 ```bash
 bash scripts/qwen_inference_online.sh 
-
+```
+```bash
+bash scripts/rvs_eval.sh 
 ```
 -OVO
 ```bash
