@@ -1,21 +1,3 @@
-"""ProtoKV cache utilities.
-
-This file implements the paper-style ProtoKV path:
-  * fixed-capacity far prototype bank plus exact near window,
-  * continuity-aware assignment with key similarity + spatial Mahalanobis + idle penalty,
-  * fixed EMA updates for key/value centers and spatial statistics,
-  * PQ residual histograms H^K/H^V and residual counts n_res,
-  * top-S residual-mode decoding with beam search,
-  * prototype maintenance: idle decay, merge, recycle,
-  * per-layer/head log-mass bias exposure for bias-aware attention.
-
-The Qwen video pipeline keeps video tokens grouped by frame. Therefore this
-implementation uses a token-position-aware frame prototype: each prototype slot
-contains one vector per within-frame visual-token position. This preserves the
-paper equations at each token position while keeping the existing block-wise
-Qwen cache layout compatible.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -95,6 +77,44 @@ def _new_state(num_layers: int, num_heads: int, max_proto_frames: int, device) -
         bias_by_layer=[None for _ in range(num_layers)],
     )
 
+
+
+
+def clear_protokv_attention_bias(model) -> None:
+    """Clear any stale ProtoKV attention-bias state from a previous sample.
+
+    The attention hook is persistent once installed, but the bias itself is
+    sample-specific. Clearing prevents a previous compressed video from
+    influencing a later uncompressed / baseline run.
+    """
+    if hasattr(model, "_protokv_bias_by_layer"):
+        model._protokv_bias_by_layer = None
+    state = getattr(model, "_prototrack_kv_state", None)
+    if isinstance(state, _ProtoTrackState) and state.bias_by_layer is not None:
+        state.bias_by_layer = [None for _ in state.bias_by_layer]
+
+
+def _auto_proto_frames_for_paper_budget(compress_frame_num: int, pq_modes: int) -> int:
+    """Default K_max that preserves the paper's W : (K_max*S) ~= 1 : 3 split.
+
+    Args:
+        compress_frame_num: total visual frame budget |M| in frame units.
+        pq_modes: S pseudo-frame modes decoded per prototype.
+    """
+    M = max(1, int(compress_frame_num))
+    S = max(1, int(pq_modes))
+    # Target far frames are approximately 3/4 of the total budget.
+    target = int(round((0.75 * M) / float(S)))
+    # Keep at least one near frame when possible.
+    max_possible = max(1, (M - 1) // S)
+    return max(1, min(max_possible, target))
+
+
+def _resolve_proto_frames_max(prototrack_proto_frames: int, compress_frame_num: int, pq_modes: int) -> int:
+    """Resolve K_max. Non-positive values mean paper-default automatic scaling."""
+    if int(prototrack_proto_frames) > 0:
+        return max(1, int(prototrack_proto_frames))
+    return _auto_proto_frames_for_paper_budget(compress_frame_num, pq_modes)
 
 def _get_or_reset_prototrack_state(model, num_layers, num_heads, max_proto_frames, device, reset) -> _ProtoTrackState:
     key = "_prototrack_kv_state"
@@ -606,7 +626,9 @@ def _prototype_maintenance(
     H, P, TPF, D = proto_k.shape
     # Idle decay.
     idle = (int(t) - taus.long()) > int(idle_threshold)
-    counts[idle & active] = torch.floor(float(decay_gamma) * counts[idle & active])
+    # Paper Algorithm 2 uses an idle-decay *rate* gamma: n_k <- floor((1-gamma) n_k).
+    retention = max(0.0, min(1.0, 1.0 - float(decay_gamma)))
+    counts[idle & active] = torch.floor(retention * counts[idle & active])
     active[counts < float(n_min)] = False
 
     # Merge close prototypes, per head.
@@ -916,21 +938,63 @@ def install_protokv_attention_bias_hook(model) -> None:
                 if not torch.is_tensor(bias):
                     return orig(*args, **kwargs)
 
-                # Locate hidden_states so we can build a mask for decode-time calls
-                # whose attention_mask is None. This is safe for q_len=1; for longer
-                # blocks we leave mask creation to the model's causal-mask path.
+                # Locate hidden_states so we can build an additive mask when the
+                # model does not pass one into the attention layer. This happens for
+                # both the first question-token block (q_len > 1) and autoregressive
+                # decoding (q_len = 1) in some Qwen/Transformers versions.
                 hidden_states = kwargs.get("hidden_states", None)
                 if hidden_states is None and "hidden_states" in param_names:
                     hs_pos = param_names.index("hidden_states")
                     if hs_pos < len(args_list):
                         hidden_states = args_list[hs_pos]
+
+                def _infer_total_k_len(q_len: int, default_len: int) -> int:
+                    pkv = kwargs.get("past_key_value", None)
+                    if pkv is None and "past_key_value" in param_names:
+                        pkv_pos = param_names.index("past_key_value")
+                        if pkv_pos < len(args_list):
+                            pkv = args_list[pkv_pos]
+                    past_len = None
+                    if pkv is not None:
+                        try:
+                            past_len = int(pkv.get_seq_length(layer_i))
+                        except Exception:
+                            try:
+                                past_len = int(pkv.get_seq_length())
+                            except Exception:
+                                past_len = None
+                        if past_len is None:
+                            try:
+                                layers_obj = getattr(pkv, "layers", None)
+                                if layers_obj is not None and layer_i < len(layers_obj):
+                                    keys = getattr(layers_obj[layer_i], "keys", None)
+                                    if torch.is_tensor(keys):
+                                        past_len = int(keys.shape[-2])
+                            except Exception:
+                                past_len = None
+                        if past_len is None and isinstance(pkv, (tuple, list)) and len(pkv) > 0:
+                            try:
+                                keys = pkv[0]
+                                if torch.is_tensor(keys):
+                                    past_len = int(keys.shape[-2])
+                            except Exception:
+                                past_len = None
+                    if past_len is not None:
+                        return max(default_len, past_len + int(q_len))
+                    return default_len
+
                 if attn_mask is None:
-                    if hidden_states is None or not torch.is_tensor(hidden_states) or hidden_states.shape[-2] != 1:
+                    if hidden_states is None or not torch.is_tensor(hidden_states):
                         return orig(*args, **kwargs)
+                    q_len_tmp = int(hidden_states.shape[-2])
                     btmp = bias.to(device=hidden_states.device, dtype=hidden_states.dtype)
-                    # Decode step: key length = compressed past length + current token.
-                    k_len_tmp = int(btmp.shape[-1]) + 1
-                    attn_mask = torch.zeros((hidden_states.shape[0], btmp.shape[1], 1, k_len_tmp), device=hidden_states.device, dtype=hidden_states.dtype)
+                    default_k_len = int(btmp.shape[-1]) + q_len_tmp
+                    k_len_tmp = _infer_total_k_len(q_len_tmp, default_k_len)
+                    attn_mask = torch.zeros(
+                        (hidden_states.shape[0], btmp.shape[1], q_len_tmp, k_len_tmp),
+                        device=hidden_states.device,
+                        dtype=hidden_states.dtype,
+                    )
 
                 if attn_mask.dim() < 4:
                     # The model should normally convert 2D masks to 4D before the layer.
@@ -980,7 +1044,7 @@ def process_kv_cache(
     is_first_block: bool = False,
     is_last_block: bool = False,
     per_frame: bool = False,
-    prototrack_proto_frames: int = 2,
+    prototrack_proto_frames: int = 0,
     prototrack_frame_end: Optional[int] = None,
     prototrack_pq_subspaces: int = 8,
     prototrack_pq_codebook_size: int = 16,
@@ -1003,7 +1067,11 @@ def process_kv_cache(
     cuda_timer=None,
     timing: Optional[Dict[str, float]] = None,
 ) -> Tuple:
+    if method != "prototrack-kv":
+        clear_protokv_attention_bias(model)
     if compress_frame_num <= 0:
+        if method == "prototrack-kv":
+            clear_protokv_attention_bias(model)
         return past_key_values, None
 
     current_seq_len = past_key_values.get_seq_length()
@@ -1013,6 +1081,8 @@ def process_kv_cache(
     assert vision_length % int(token_per_frame) == 0, (vision_length, token_per_frame)
     current_frame_num = vision_length // int(token_per_frame)
     if current_frame_num <= int(compress_frame_num):
+        if method == "prototrack-kv":
+            clear_protokv_attention_bias(model)
         return past_key_values, None
 
     # Get language layers robustly.
@@ -1026,7 +1096,8 @@ def process_kv_cache(
         ks0 = past_key_values.layers[0].keys
         device0 = ks0.device
         _, num_heads0, _, _ = ks0.shape
-        state = _get_or_reset_prototrack_state(model, num_layers, num_heads0, max(1, int(prototrack_proto_frames)), device0, reset=bool(is_first_block))
+        proto_frames_max = _resolve_proto_frames_max(prototrack_proto_frames, compress_frame_num, prototrack_pq_modes)
+        state = _get_or_reset_prototrack_state(model, num_layers, num_heads0, proto_frames_max, device0, reset=bool(is_first_block))
         install_protokv_attention_bias_hook(model)
 
     for layer_idx in range(num_layers):

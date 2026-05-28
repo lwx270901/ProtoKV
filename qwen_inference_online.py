@@ -27,7 +27,7 @@ from transformers import (
     Qwen2_5_VLForConditionalGeneration,
 )
 
-from kvcache_utils_proto import process_kv_cache, install_protokv_attention_bias_hook
+from kvcache_utils_proto import process_kv_cache, install_protokv_attention_bias_hook, clear_protokv_attention_bias
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -41,6 +41,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 VIDEO_FORMATS = (".mp4", ".avi", ".mov", ".mkv")
+
+
+def _paper_default_proto_frames(compress_frame_num: int, modes_per_proto: int) -> int:
+    """Kmax for the paper default W:(Kmax*S)=1:3 split."""
+    M = max(1, int(compress_frame_num))
+    S = max(1, int(modes_per_proto))
+    max_p_for_near = max(1, (M - 1) // S)
+    target_p = max(1, int(round((3.0 * float(M)) / (4.0 * float(S)))))
+    return max(1, min(target_p, max_p_for_near))
 
 
 class _NoOpTimer:
@@ -329,7 +338,7 @@ class RVSVideoEval:
         load_dumped: bool = False,
         cache_dir: str = "cache/qwen_rvs_video_inputs",
         per_frame: bool = False,
-        prototrack_proto_frames: int = 24,
+        prototrack_proto_frames: int = 0,
         prototrack_pq_subspaces: int = 8,
         prototrack_pq_codebook_size: int = 16,
         prototrack_pq_kmeans_iters: int = 4,
@@ -366,13 +375,16 @@ class RVSVideoEval:
         self.load_dumped = load_dumped
         self.cache_dir = cache_dir
         self.per_frame = per_frame
-        self.prototrack_proto_frames = int(prototrack_proto_frames)
+        self.prototrack_pq_modes = int(prototrack_pq_modes)
+        if int(prototrack_proto_frames) <= 0 and int(compress_frame_num) > 0:
+            self.prototrack_proto_frames = _paper_default_proto_frames(int(compress_frame_num), self.prototrack_pq_modes)
+        else:
+            self.prototrack_proto_frames = int(prototrack_proto_frames)
         self.prototrack_pq_subspaces = int(prototrack_pq_subspaces)
         self.prototrack_pq_codebook_size = int(prototrack_pq_codebook_size)
         self.prototrack_pq_kmeans_iters = int(prototrack_pq_kmeans_iters)
         self.prototrack_pq_sample_size = int(prototrack_pq_sample_size)
         self.prototrack_pq_seed = int(prototrack_pq_seed)
-        self.prototrack_pq_modes = int(prototrack_pq_modes)
         self.prototrack_pq_beam_size = int(prototrack_pq_beam_size)
         self.prototrack_pq_beam_eps = float(prototrack_pq_beam_eps)
         self.prototrack_lambda_sp = float(prototrack_lambda_sp)
@@ -386,6 +398,9 @@ class RVSVideoEval:
         self.prototrack_merge_eps_v = float(prototrack_merge_eps_v)
         self.prototrack_min_mass = float(prototrack_min_mass)
         self.attn_implementation = str(attn_implementation)
+        if self.compression_method == "prototrack-kv" and self.attn_implementation != "eager":
+            logger.warning("ProtoKV log-mass bias requires additive/eager attention; forcing attn_implementation='eager'.")
+            self.attn_implementation = "eager"
         self.gpu_max_memory_gib = float(gpu_max_memory_gib or 0.0)
         self.cpu_max_memory_gib = float(cpu_max_memory_gib or 0.0)
         self.verbose = verbose
@@ -410,6 +425,10 @@ class RVSVideoEval:
                     f"sample_size={self.prototrack_pq_sample_size}, "
                     f"S={self.prototrack_pq_modes}, B={self.prototrack_pq_beam_size or 4 * self.prototrack_pq_modes}"
                 )
+                if self.compress_frame_num > 0:
+                    far_frames = self.prototrack_proto_frames * self.prototrack_pq_modes
+                    near_frames = max(1, self.compress_frame_num - far_frames)
+                    logger.info(f"  ProtoKV budget split: W={near_frames}, Kmax={self.prototrack_proto_frames}, Kmax*S={far_frames}")
                 logger.info(
                     f"  ProtoKV paper EMA/assign: alpha={self.prototrack_alpha}, beta={self.prototrack_beta}, "
                     f"eta={self.prototrack_eta}, lambda_sp={self.prototrack_lambda_sp}, "
@@ -760,6 +779,7 @@ class RVSVideoEval:
     def generate(self, inputs: Dict[str, Any]) -> str:
         """Standard (non-block) generation with explicit encode / prefill / decode phases."""
         logger.info("Running standard generation...")
+        clear_protokv_attention_bias(self.model)
         inputs.pop("second_per_grid_ts", None)
 
         input_ids    = inputs["input_ids"]
@@ -1054,6 +1074,7 @@ class RVSVideoEval:
 
     def block_process(self, inputs: Dict[str, Any]) -> str:
         logger.info("Running block-wise processing...")
+        clear_protokv_attention_bias(self.model)
         input_ids = inputs["input_ids"]
         video_token_id = self.model.config.video_token_id
         frame_number = int(inputs["video_grid_thw"][0, 0].item())
@@ -1109,7 +1130,8 @@ def main() -> None:
         action="store_true",
         help="Use frame-wise block prefill (1 frame per prefill step) and per-frame compression after warmup.",
     )
-    parser.add_argument("--prototrack_proto_frames", type=int, default=18)
+    parser.add_argument("--prototrack_proto_frames", type=int, default=0,
+                        help="K_max prototype frame slots. Use 0 for paper default auto scaling W:(K_max*S)=1:3.")
     parser.add_argument("--prototrack_pq_subspaces", type=int, default=8,
                         help="Number of PQ subquantizers for ProtoTrack residual histograms. Set 0 to disable residual PQ.")
     parser.add_argument("--prototrack_pq_codebook_size", type=int, default=16,
@@ -1132,7 +1154,8 @@ def main() -> None:
     parser.add_argument("--prototrack_alpha", type=float, default=0.05)
     parser.add_argument("--prototrack_beta", type=float, default=0.05)
     parser.add_argument("--prototrack_eta", type=float, default=0.05)
-    parser.add_argument("--prototrack_maintenance_gamma", type=float, default=0.05)
+    parser.add_argument("--prototrack_maintenance_gamma", type=float, default=0.05,
+                        help="Idle mass decay rate gamma in n<-floor((1-gamma)n). Paper default: 0.05.")
     parser.add_argument("--prototrack_merge_eps_k", type=float, default=0.20)
     parser.add_argument("--prototrack_merge_eps_v", type=float, default=0.25)
     parser.add_argument("--prototrack_min_mass", type=float, default=1.0)

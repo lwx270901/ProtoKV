@@ -13,8 +13,17 @@ from qwen_vl_utils import process_vision_info
 import argparse
 
 # Import utilities
-from kvcache_utils_proto import process_kv_cache, install_protokv_attention_bias_hook
+from kvcache_utils_proto import process_kv_cache, install_protokv_attention_bias_hook, clear_protokv_attention_bias
 from dataset_utils import EvalDataset, format_question, extract_answer, get_default_data_path
+
+
+def _paper_default_proto_frames(compress_frame_num: int, modes_per_proto: int) -> int:
+    """Kmax for the paper default W:(Kmax*S)=1:3 split."""
+    M = max(1, int(compress_frame_num))
+    S = max(1, int(modes_per_proto))
+    max_p_for_near = max(1, (M - 1) // S)
+    target_p = max(1, int(round((3.0 * float(M)) / (4.0 * float(S)))))
+    return max(1, min(target_p, max_p_for_near))
 
 
 class OfflineVideoEval:
@@ -34,7 +43,7 @@ class OfflineVideoEval:
     
     def __init__(self, model_path, max_frames_num=32, max_pixels=None, block_size=-1, compress_frame_num=0, 
                  compression_method="uniform", tar_ratio=0.5, query_ratio=0.25, adaptive_pooling=False, 
-                 load_dumped=False, per_frame=False, prototrack_proto_frames=2,
+                 load_dumped=False, per_frame=False, prototrack_proto_frames=0,
                  prototrack_pq_subspaces=8, prototrack_pq_codebook_size=16,
                  prototrack_pq_kmeans_iters=4, prototrack_pq_sample_size=4096,
                  prototrack_pq_seed=0, prototrack_pq_modes=8,
@@ -73,13 +82,16 @@ class OfflineVideoEval:
         self.adaptive_pooling = adaptive_pooling
         self.load_dumped = load_dumped
         self.per_frame = per_frame
-        self.prototrack_proto_frames = int(prototrack_proto_frames)
+        self.prototrack_pq_modes = int(prototrack_pq_modes)
+        if int(prototrack_proto_frames) <= 0 and int(compress_frame_num) > 0:
+            self.prototrack_proto_frames = _paper_default_proto_frames(int(compress_frame_num), self.prototrack_pq_modes)
+        else:
+            self.prototrack_proto_frames = int(prototrack_proto_frames)
         self.prototrack_pq_subspaces = int(prototrack_pq_subspaces)
         self.prototrack_pq_codebook_size = int(prototrack_pq_codebook_size)
         self.prototrack_pq_kmeans_iters = int(prototrack_pq_kmeans_iters)
         self.prototrack_pq_sample_size = int(prototrack_pq_sample_size)
         self.prototrack_pq_seed = int(prototrack_pq_seed)
-        self.prototrack_pq_modes = int(prototrack_pq_modes)
         self.prototrack_pq_beam_size = int(prototrack_pq_beam_size)
         self.prototrack_pq_beam_eps = float(prototrack_pq_beam_eps)
         self.prototrack_lambda_sp = float(prototrack_lambda_sp)
@@ -93,6 +105,9 @@ class OfflineVideoEval:
         self.prototrack_merge_eps_v = float(prototrack_merge_eps_v)
         self.prototrack_min_mass = float(prototrack_min_mass)
         self.attn_implementation = str(attn_implementation)
+        if self.compression_method == "prototrack-kv" and self.attn_implementation != "eager":
+            print("ProtoKV log-mass bias requires additive/eager attention; forcing attn_implementation='eager'.")
+            self.attn_implementation = "eager"
         self.gpu_max_memory_gib = float(gpu_max_memory_gib or 0.0)
         self.cpu_max_memory_gib = float(cpu_max_memory_gib or 0.0)
         self.model = None
@@ -322,6 +337,7 @@ class OfflineVideoEval:
         Returns:
             Generated response text
         """
+        clear_protokv_attention_bias(self.model)
         with torch.no_grad():
             inputs = dict(inputs)
             inputs.pop("second_per_grid_ts", None) # for qwen2
@@ -611,6 +627,7 @@ class OfflineVideoEval:
         Returns:
             Generated response text
         """
+        clear_protokv_attention_bias(self.model)
         # Extract video tokens and calculate dimensions
         input_ids = inputs["input_ids"]
         video_token_id = self.model.config.video_token_id
@@ -904,8 +921,8 @@ def main():
                         help="Use adaptive pooling for KV cache compression")
     parser.add_argument("--per_frame", action="store_true",
                         help="Select complete frames instead of individual tokens")
-    parser.add_argument("--prototrack_proto_frames", type=int, default=2,
-                        help="Number of far-history prototype frames for ProtoKV")
+    parser.add_argument("--prototrack_proto_frames", type=int, default=0,
+                        help="K_max prototype frame slots. Use 0 for paper default auto scaling W:(K_max*S)=1:3.")
     parser.add_argument("--prototrack_pq_subspaces", type=int, default=8,
                         help="PQ subquantizers for ProtoKV residual histograms; set 0 to disable")
     parser.add_argument("--prototrack_pq_codebook_size", type=int, default=16,
@@ -935,7 +952,7 @@ def main():
     parser.add_argument("--prototrack_eta", type=float, default=0.05,
                         help="EMA rate for spatial statistics. Paper default: 0.05.")
     parser.add_argument("--prototrack_maintenance_gamma", type=float, default=0.05,
-                        help="Idle mass decay factor for prototype maintenance. Paper default: 0.05.")
+                        help="Idle mass decay rate gamma for n <- floor((1-gamma)n). Paper default: 0.05.")
     parser.add_argument("--prototrack_merge_eps_k", type=float, default=0.20,
                         help="Key-center merge threshold epsilon_K. Paper default: 0.20.")
     parser.add_argument("--prototrack_merge_eps_v", type=float, default=0.25,
@@ -1002,6 +1019,10 @@ def main():
             print(f"Compression method: {args.compression_method}")
             if args.compression_method == "prototrack-kv":
                 print(f"ProtoKV top-S: S={args.prototrack_pq_modes}, B={args.prototrack_pq_beam_size or 4 * args.prototrack_pq_modes}, eps={args.prototrack_pq_beam_eps}")
+                resolved_k = evaluator.prototrack_proto_frames
+                far_frames = resolved_k * evaluator.prototrack_pq_modes
+                near_frames = max(1, evaluator.compress_frame_num - far_frames) if evaluator.compress_frame_num > 0 else 0
+                print(f"ProtoKV budget split: W={near_frames}, Kmax={resolved_k}, Kmax*S={far_frames}")
                 print(f"ProtoKV paper params: lambda_sp={args.prototrack_lambda_sp}, lambda_idle={args.prototrack_lambda_idle}, T_idle={args.prototrack_idle_threshold}")
                 print(f"ProtoKV EMA: alpha={args.prototrack_alpha}, beta={args.prototrack_beta}, eta={args.prototrack_eta}; maintenance gamma={args.prototrack_maintenance_gamma}")
                 print(f"Attention implementation: {args.attn_implementation}")
