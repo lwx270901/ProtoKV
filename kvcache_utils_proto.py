@@ -356,6 +356,81 @@ def _decode_top_s_hist_batch(hist: torch.Tensor, codebooks: torch.Tensor, modes:
     return torch.stack(out_per_h, dim=0)  # [H,P,TPF,S,D]
 
 
+
+# ---------------------------------------------------------------------------
+# RoPE re-anchoring helpers
+# ---------------------------------------------------------------------------
+
+def _get_rope_theta_from_model(model) -> float:
+    """Best-effort extraction of the RoPE base used by the language model.
+
+    ProtoKV keeps prototype Keys in a fixed rotary frame. When a new source
+    frame at time t is absorbed into prototype k, we rotate the prototype key
+    from its old anchor tau_k to t before the EMA update. This implements the
+    paper's tau_k anchoring while remaining backend-independent. If the model
+    config does not expose rope_theta, we fall back to the standard 10000.0.
+    """
+    seen = set()
+    stack = [getattr(model, "config", None), getattr(getattr(model, "model", None), "config", None)]
+    while stack:
+        cfg = stack.pop()
+        if cfg is None or id(cfg) in seen:
+            continue
+        seen.add(id(cfg))
+        val = getattr(cfg, "rope_theta", None)
+        if val is not None:
+            try:
+                return float(val)
+            except Exception:
+                pass
+        for name in ("text_config", "language_config", "llm_config", "vision_config"):
+            child = getattr(cfg, name, None)
+            if child is not None:
+                stack.append(child)
+    return 10000.0
+
+
+def _rotate_half_split(x: torch.Tensor) -> torch.Tensor:
+    half = x.shape[-1] // 2
+    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+
+def _rope_relative_rotate(x: torch.Tensor, delta_pos, rope_theta: Optional[float]) -> torch.Tensor:
+    """Apply R(delta_pos) to already-rotated Keys.
+
+    If x = R(src) x_base, this returns R(dst) x_base for delta_pos=dst-src.
+    The implementation follows the split-half RoPE layout used by Qwen/Llama
+    attention. For odd head dimensions or disabled theta, it is a no-op.
+    """
+    if rope_theta is None or x.shape[-1] % 2 != 0:
+        return x
+    D = x.shape[-1]
+    device = x.device
+    dtype = x.dtype
+    inv_freq = 1.0 / (float(rope_theta) ** (torch.arange(0, D, 2, device=device, dtype=torch.float32) / D))
+    delta = torch.as_tensor(delta_pos, device=device, dtype=torch.float32)
+    freqs = delta.unsqueeze(-1) * inv_freq
+    emb = torch.cat((freqs, freqs), dim=-1)
+    # Unsqueeze until emb broadcasts to x.
+    while emb.dim() < x.dim():
+        emb = emb.unsqueeze(-2)
+    cos = emb.cos().to(dtype=dtype)
+    sin = emb.sin().to(dtype=dtype)
+    return (x * cos) + (_rotate_half_split(x) * sin)
+
+
+def _reanchor_frame_key(frame_k: torch.Tensor, src_t: int, dst_t: int, rope_theta: Optional[float]) -> torch.Tensor:
+    if rope_theta is None or int(src_t) == int(dst_t):
+        return frame_k
+    return _rope_relative_rotate(frame_k, int(dst_t) - int(src_t), rope_theta)
+
+
+def _reanchor_proto_candidates(proto_k: torch.Tensor, taus: torch.Tensor, dst_t: int, rope_theta: Optional[float]) -> torch.Tensor:
+    if rope_theta is None:
+        return proto_k
+    delta = int(dst_t) - taus.to(device=proto_k.device, dtype=torch.float32)
+    return _rope_relative_rotate(proto_k, delta, rope_theta)
+
 # ---------------------------------------------------------------------------
 # Proto bank exact streaming update / maintenance
 # ---------------------------------------------------------------------------
@@ -372,11 +447,12 @@ def _prototype_assignment_for_head(
     lambda_sp: float,
     lambda_idle: float,
     idle_threshold: int,
+    rope_theta: Optional[float] = None,
 ) -> int:
     active_idx = torch.nonzero(active_h, as_tuple=False).flatten()
     if active_idx.numel() == 0:
         return -1
-    pk = proto_k_h[active_idx]  # [Pact,TPF,D]
+    pk = _reanchor_proto_candidates(proto_k_h[active_idx], taus_h[active_idx], int(t), rope_theta)  # [Pact,TPF,D]
     # Average token-wise cosine similarity.
     cos = F.cosine_similarity(frame_k_h.unsqueeze(0).float(), pk.float(), dim=-1).mean(dim=-1)  # [Pact]
 
@@ -475,6 +551,7 @@ def _absorb_frame(
     lambda_sp: float,
     lambda_idle: float,
     idle_threshold: int,
+    rope_theta: Optional[float] = None,
     proto_update_ctx=None,
 ) -> None:
     H = frame_k.shape[0]
@@ -486,13 +563,17 @@ def _absorb_frame(
             continue
         k = _prototype_assignment_for_head(
             frame_k[h], proto_k[h], active[h], coords, mus[h], sigmas[h], taus[h], t,
-            lambda_sp=lambda_sp, lambda_idle=lambda_idle, idle_threshold=idle_threshold,
+            lambda_sp=lambda_sp, lambda_idle=lambda_idle, idle_threshold=idle_threshold, rope_theta=rope_theta,
         )
         if k < 0:
             k = 0
         ctx = proto_update_ctx if proto_update_ctx is not None else _NullCtx(None)
         with ctx:
-            proto_k[h, k] = ((1.0 - float(alpha)) * proto_k[h, k].float() + float(alpha) * frame_k[h].float()).to(proto_k.dtype)
+            # Keep prototype Keys anchored at the most recently absorbed source time tau_k.
+            # Before absorbing a frame at time t, rotate the stored prototype from old tau_k
+            # into the current frame's rotary frame, then set tau_k <- t.
+            proto_k_current = _reanchor_frame_key(proto_k[h, k], int(taus[h, k].item()), int(t), rope_theta).float()
+            proto_k[h, k] = ((1.0 - float(alpha)) * proto_k_current + float(alpha) * frame_k[h].float()).to(proto_k.dtype)
             proto_v[h, k] = ((1.0 - float(beta)) * proto_v[h, k].float() + float(beta) * frame_v[h].float()).to(proto_v.dtype)
             counts[h, k] += 1.0
             taus[h, k] = int(t)
@@ -522,6 +603,7 @@ def _collect_residuals_for_codebook(
     lambda_sp: float,
     lambda_idle: float,
     idle_threshold: int,
+    rope_theta: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     H, Fnum, TPF, D = frames_k.shape
     residuals_k = [[] for _ in range(H)]
@@ -529,10 +611,10 @@ def _collect_residuals_for_codebook(
     for f in range(Fnum):
         t = int(t0 + f)
         for h in range(H):
-            k = _prototype_assignment_for_head(frames_k[h, f], proto_k[h], active[h], coords, mus[h], sigmas[h], taus[h], t, lambda_sp, lambda_idle, idle_threshold)
+            k = _prototype_assignment_for_head(frames_k[h, f], proto_k[h], active[h], coords, mus[h], sigmas[h], taus[h], t, lambda_sp, lambda_idle, idle_threshold, rope_theta=rope_theta)
             if k < 0:
                 k = 0
-            residuals_k[h].append((frames_k[h, f].float() - proto_k[h, k].float()).reshape(TPF, D))
+            residuals_k[h].append((frames_k[h, f].float() - _reanchor_frame_key(proto_k[h, k], int(taus[h, k].item()), t, rope_theta).float()).reshape(TPF, D))
             residuals_v[h].append((frames_v[h, f].float() - proto_v[h, k].float()).reshape(TPF, D))
     rk = torch.stack([torch.cat(residuals_k[h], dim=0) if residuals_k[h] else torch.zeros((1, D), device=frames_k.device) for h in range(H)], dim=0)
     rv = torch.stack([torch.cat(residuals_v[h], dim=0) if residuals_v[h] else torch.zeros((1, D), device=frames_v.device) for h in range(H)], dim=0)
@@ -560,34 +642,38 @@ def _rebuild_histograms_from_frames(
     lambda_sp: float,
     lambda_idle: float,
     idle_threshold: int,
+    rope_theta: Optional[float] = None,
 ) -> None:
     hist_k.zero_(); hist_v.zero_(); res_counts.zero_()
     H, Fnum, _, _ = frames_k.shape
     for f in range(Fnum):
         t = int(t0 + f)
         for h in range(H):
-            k = _prototype_assignment_for_head(frames_k[h, f], proto_k[h], active[h], coords, mus[h], sigmas[h], taus[h], t, lambda_sp, lambda_idle, idle_threshold)
+            k = _prototype_assignment_for_head(frames_k[h, f], proto_k[h], active[h], coords, mus[h], sigmas[h], taus[h], t, lambda_sp, lambda_idle, idle_threshold, rope_theta=rope_theta)
             if k < 0:
                 continue
-            rK = frames_k[h, f].float() - proto_k[h, k].float()
+            rK = frames_k[h, f].float() - _reanchor_frame_key(proto_k[h, k], int(taus[h, k].item()), t, rope_theta).float()
             rV = frames_v[h, f].float() - proto_v[h, k].float()
             _update_residual_hist_one(hist_k, hist_v, res_counts, h, k, rK, rV, codebook_k, codebook_v)
 
 
 @torch.no_grad()
 def _merge_slots_for_head(
-    proto_k, proto_v, counts, active, taus, mus, sigmas, hist_k, hist_v, res_counts, h: int, i: int, j: int) -> None:
+    proto_k, proto_v, counts, active, taus, mus, sigmas, hist_k, hist_v, res_counts, h: int, i: int, j: int, rope_theta: Optional[float] = None) -> None:
     ni = counts[h, i].clone()
     nj = counts[h, j].clone()
     denom = (ni + nj).clamp(min=1.0)
     wi = (ni / denom).to(torch.float32)
     wj = (nj / denom).to(torch.float32)
-    proto_k[h, i] = (wi * proto_k[h, i].float() + wj * proto_k[h, j].float()).to(proto_k.dtype)
+    tau_new = int(torch.maximum(taus[h, i], taus[h, j]).item())
+    key_i = _reanchor_frame_key(proto_k[h, i], int(taus[h, i].item()), tau_new, rope_theta).float()
+    key_j = _reanchor_frame_key(proto_k[h, j], int(taus[h, j].item()), tau_new, rope_theta).float()
+    proto_k[h, i] = (wi * key_i + wj * key_j).to(proto_k.dtype)
     proto_v[h, i] = (wi * proto_v[h, i].float() + wj * proto_v[h, j].float()).to(proto_v.dtype)
     mus[h, i] = wi * mus[h, i] + wj * mus[h, j]
     sigmas[h, i] = wi * sigmas[h, i] + wj * sigmas[h, j]
     counts[h, i] = ni + nj
-    taus[h, i] = torch.maximum(taus[h, i], taus[h, j])
+    taus[h, i] = tau_new
     if hist_k is not None:
         hist_k[h, i] += hist_k[h, j]
         hist_k[h, j].zero_()
@@ -622,6 +708,7 @@ def _prototype_maintenance(
     merge_eps_k: float,
     merge_eps_v: float,
     n_min: float,
+    rope_theta: Optional[float] = None,
 ) -> None:
     H, P, TPF, D = proto_k.shape
     # Idle decay.
@@ -639,10 +726,13 @@ def _prototype_maintenance(
             for j in range(i + 1, P):
                 if not bool(active[h, j]):
                     continue
-                dk = torch.norm((proto_k[h, i].float() - proto_k[h, j].float()).reshape(-1)) / math.sqrt(float(TPF * D))
+                tau_cmp = int(torch.maximum(taus[h, i], taus[h, j]).item())
+                key_i_cmp = _reanchor_frame_key(proto_k[h, i], int(taus[h, i].item()), tau_cmp, rope_theta).float()
+                key_j_cmp = _reanchor_frame_key(proto_k[h, j], int(taus[h, j].item()), tau_cmp, rope_theta).float()
+                dk = torch.norm((key_i_cmp - key_j_cmp).reshape(-1)) / math.sqrt(float(TPF * D))
                 dv = torch.norm((proto_v[h, i].float() - proto_v[h, j].float()).reshape(-1)) / math.sqrt(float(TPF * D))
                 if float(dk.item()) < float(merge_eps_k) and float(dv.item()) < float(merge_eps_v):
-                    _merge_slots_for_head(proto_k, proto_v, counts, active, taus, mus, sigmas, hist_k, hist_v, res_counts, h, i, j)
+                    _merge_slots_for_head(proto_k, proto_v, counts, active, taus, mus, sigmas, hist_k, hist_v, res_counts, h, i, j, rope_theta=rope_theta)
 
     # Recycle inactive / low mass slots from recent exact window.
     if near_k.numel() == 0:
@@ -703,6 +793,7 @@ def _protokv_compress_layer_exact(
     n_min: float,
     cuda_timer=None,
     timing: Optional[Dict[str, float]] = None,
+    rope_theta: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool, int, Optional[torch.Tensor], Optional[torch.Tensor]]:
     assert key_states_to_compress.dim() == 4 and key_states_to_compress.shape[0] == 1
     _, H, L, D = key_states_to_compress.shape
@@ -755,8 +846,14 @@ def _protokv_compress_layer_exact(
                     kf[:, f], vf[:, f], proto_k, proto_v, counts[:, :proto_frames_target], active[:, :proto_frames_target], taus[:, :proto_frames_target],
                     mus[:, :proto_frames_target], sigmas[:, :proto_frames_target],
                     None, None, None, None, None, coords, int(t_start + f), alpha, beta, eta, lambda_sp, lambda_idle, idle_threshold,
-                    proto_update_ctx=ctx_factory(),
+                    rope_theta=rope_theta, proto_update_ctx=ctx_factory(),
                 )
+                if bool(active[:, :proto_frames_target].all()):
+                    _prototype_maintenance(
+                        proto_k, proto_v, counts[:, :proto_frames_target], active[:, :proto_frames_target], taus[:, :proto_frames_target],
+                        mus[:, :proto_frames_target], sigmas[:, :proto_frames_target], None, None, None,
+                        near_k, near_v, coords, int(t_start + f), idle_threshold, maintenance_gamma, merge_eps_k, merge_eps_v, n_min, rope_theta=rope_theta,
+                    )
         else:
             # No far frames yet; seed from near frame to maintain a valid bank.
             seed = 0
@@ -767,10 +864,10 @@ def _protokv_compress_layer_exact(
 
         # Fit PQ codebooks and rebuild histograms from far frames once prototypes exist.
         if int(pq_subspaces) > 0 and pq_hist_k is not None and far_frames > 0:
-            rk, rv = _collect_residuals_for_codebook(kf[:, :far_frames], vf[:, :far_frames], proto_k, proto_v, active[:, :proto_frames_target], coords, mus[:, :proto_frames_target], sigmas[:, :proto_frames_target], taus[:, :proto_frames_target], t_start, lambda_sp, lambda_idle, idle_threshold)
+            rk, rv = _collect_residuals_for_codebook(kf[:, :far_frames], vf[:, :far_frames], proto_k, proto_v, active[:, :proto_frames_target], coords, mus[:, :proto_frames_target], sigmas[:, :proto_frames_target], taus[:, :proto_frames_target], t_start, lambda_sp, lambda_idle, idle_threshold, rope_theta=rope_theta)
             pq_codebook_k = _pq_fit_codebooks_per_head(rk, pq_subspaces, pq_codebook_size, pq_kmeans_iters, pq_sample_size, pq_seed + 17)
             pq_codebook_v = _pq_fit_codebooks_per_head(rv, pq_subspaces, pq_codebook_size, pq_kmeans_iters, pq_sample_size, pq_seed + 29)
-            _rebuild_histograms_from_frames(kf[:, :far_frames], vf[:, :far_frames], proto_k, proto_v, counts[:, :proto_frames_target], active[:, :proto_frames_target], taus[:, :proto_frames_target], mus[:, :proto_frames_target], sigmas[:, :proto_frames_target], pq_hist_k[:, :proto_frames_target], pq_hist_v[:, :proto_frames_target], pq_res_counts[:, :proto_frames_target], pq_codebook_k, pq_codebook_v, coords, t_start, lambda_sp, lambda_idle, idle_threshold)
+            _rebuild_histograms_from_frames(kf[:, :far_frames], vf[:, :far_frames], proto_k, proto_v, counts[:, :proto_frames_target], active[:, :proto_frames_target], taus[:, :proto_frames_target], mus[:, :proto_frames_target], sigmas[:, :proto_frames_target], pq_hist_k[:, :proto_frames_target], pq_hist_v[:, :proto_frames_target], pq_res_counts[:, :proto_frames_target], pq_codebook_k, pq_codebook_v, coords, t_start, lambda_sp, lambda_idle, idle_threshold, rope_theta=rope_theta)
     else:
         P_old = int(state_proto_frames_cur)
         P_old = min(P_old, counts.shape[1], max(1, P_old))
@@ -788,7 +885,7 @@ def _protokv_compress_layer_exact(
                             continue
                         sim = F.cosine_similarity(proto_k[h, j].mean(0).float().view(1, -1), proto_k[h, :P_new].mean(1).float(), dim=-1)
                         i = int(sim.argmax().item())
-                        _merge_slots_for_head(proto_k, proto_v, counts, active, taus, mus, sigmas, pq_hist_k, pq_hist_v, pq_res_counts, h, i, j)
+                        _merge_slots_for_head(proto_k, proto_v, counts, active, taus, mus, sigmas, pq_hist_k, pq_hist_v, pq_res_counts, h, i, j, rope_theta=rope_theta)
                 active[:, P_new:P_old] = False; counts[:, P_new:P_old] = 0
                 if pq_hist_k is not None:
                     pq_hist_k[:, P_new:P_old].zero_(); pq_hist_v[:, P_new:P_old].zero_(); pq_res_counts[:, P_new:P_old].zero_()
@@ -815,8 +912,17 @@ def _protokv_compress_layer_exact(
                     kf[:, f], vf[:, f], proto_k, proto_v, counts[:, :P_cur], active[:, :P_cur], taus[:, :P_cur],
                     mus[:, :P_cur], sigmas[:, :P_cur], pq_hist_k[:, :P_cur] if pq_hist_k is not None else None, pq_hist_v[:, :P_cur] if pq_hist_v is not None else None, pq_res_counts[:, :P_cur] if pq_res_counts is not None else None,
                     pq_codebook_k, pq_codebook_v, coords, int(t_start + f), alpha, beta, eta, lambda_sp, lambda_idle, idle_threshold,
-                    proto_update_ctx=ctx_factory(),
+                    rope_theta=rope_theta, proto_update_ctx=ctx_factory(),
                 )
+                if bool(active[:, :P_cur].all()):
+                    _prototype_maintenance(
+                        proto_k, proto_v, counts[:, :P_cur], active[:, :P_cur], taus[:, :P_cur],
+                        mus[:, :P_cur], sigmas[:, :P_cur],
+                        pq_hist_k[:, :P_cur] if pq_hist_k is not None else None,
+                        pq_hist_v[:, :P_cur] if pq_hist_v is not None else None,
+                        pq_res_counts[:, :P_cur] if pq_res_counts is not None else None,
+                        near_k, near_v, coords, int(t_start + f), idle_threshold, maintenance_gamma, merge_eps_k, merge_eps_v, n_min, rope_theta=rope_theta,
+                    )
 
         # If codebooks do not exist yet, fit from absorbed exact frames and rebuild hist.
         if int(pq_subspaces) > 0 and pq_hist_k is not None and (pq_codebook_k is None or pq_codebook_v is None) and near_start > 0:
@@ -824,20 +930,14 @@ def _protokv_compress_layer_exact(
             fit_k = kf[:, far_for_fit_start:near_start]
             fit_v = vf[:, far_for_fit_start:near_start]
             if fit_k.shape[1] > 0:
-                rk, rv = _collect_residuals_for_codebook(fit_k, fit_v, proto_k, proto_v, active[:, :P_cur], coords, mus[:, :P_cur], sigmas[:, :P_cur], taus[:, :P_cur], t_start + far_for_fit_start, lambda_sp, lambda_idle, idle_threshold)
+                rk, rv = _collect_residuals_for_codebook(fit_k, fit_v, proto_k, proto_v, active[:, :P_cur], coords, mus[:, :P_cur], sigmas[:, :P_cur], taus[:, :P_cur], t_start + far_for_fit_start, lambda_sp, lambda_idle, idle_threshold, rope_theta=rope_theta)
                 pq_codebook_k = _pq_fit_codebooks_per_head(rk, pq_subspaces, pq_codebook_size, pq_kmeans_iters, pq_sample_size, pq_seed + 17)
                 pq_codebook_v = _pq_fit_codebooks_per_head(rv, pq_subspaces, pq_codebook_size, pq_kmeans_iters, pq_sample_size, pq_seed + 29)
-                _rebuild_histograms_from_frames(fit_k, fit_v, proto_k, proto_v, counts[:, :P_cur], active[:, :P_cur], taus[:, :P_cur], mus[:, :P_cur], sigmas[:, :P_cur], pq_hist_k[:, :P_cur], pq_hist_v[:, :P_cur], pq_res_counts[:, :P_cur], pq_codebook_k, pq_codebook_v, coords, t_start + far_for_fit_start, lambda_sp, lambda_idle, idle_threshold)
+                _rebuild_histograms_from_frames(fit_k, fit_v, proto_k, proto_v, counts[:, :P_cur], active[:, :P_cur], taus[:, :P_cur], mus[:, :P_cur], sigmas[:, :P_cur], pq_hist_k[:, :P_cur], pq_hist_v[:, :P_cur], pq_res_counts[:, :P_cur], pq_codebook_k, pq_codebook_v, coords, t_start + far_for_fit_start, lambda_sp, lambda_idle, idle_threshold, rope_theta=rope_theta)
 
     P_final = proto_frames_target
-    # Algorithm 2 maintenance.
-    _prototype_maintenance(
-        proto_k, proto_v, counts[:, :P_final], active[:, :P_final], taus[:, :P_final], mus[:, :P_final], sigmas[:, :P_final],
-        pq_hist_k[:, :P_final] if pq_hist_k is not None else None,
-        pq_hist_v[:, :P_final] if pq_hist_v is not None else None,
-        pq_res_counts[:, :P_final] if pq_res_counts is not None else None,
-        near_k, near_v, coords, t_end, idle_threshold, maintenance_gamma, merge_eps_k, merge_eps_v, n_min,
-    )
+    # Algorithm 2 maintenance is applied immediately after each absorbed frame once
+    # the prototype bank is populated, matching the streaming update flow.
 
     # Algorithm 4: top-S pseudo-token synthesis.
     proto_base_k = proto_k[:, :P_final].contiguous()
@@ -856,7 +956,8 @@ def _protokv_compress_layer_exact(
         proto_modes_k = proto_base_k.unsqueeze(3).expand(-1, -1, -1, S_modes, -1)
         proto_modes_v = proto_base_v.unsqueeze(3).expand(-1, -1, -1, S_modes, -1)
 
-    # Order: prototype k, modes s, then within-frame tokens.
+    # Prototype Keys are stored in their latest tau_k rotary frame; all S modes from
+    # prototype k inherit that anchor. Order: prototype k, modes s, then within-frame tokens.
     proto_out_k = proto_modes_k.permute(0, 1, 3, 2, 4).reshape(H, P_final * S_modes, int(token_per_frame), D).contiguous()
     proto_out_v = proto_modes_v.permute(0, 1, 3, 2, 4).reshape(H, P_final * S_modes, int(token_per_frame), D).contiguous()
     new_kf = torch.cat([proto_out_k, near_k], dim=1)
@@ -1007,9 +1108,10 @@ def install_protokv_attention_bias_hook(model) -> None:
                     kb = min(int(b.shape[-1]), int(k_len))
                     add = torch.zeros((1, h_bias, 1, k_len), device=attn_mask.device, dtype=attn_mask.dtype)
                     add[..., :kb] = b[..., :kb].unsqueeze(-2)
-                    # If attention mask has one head, reduce bias across heads to keep shape compatible.
+                    # Preserve the paper's per-head log-mass bias. If the model provides
+                    # a single-head additive mask, expand it across heads rather than averaging bias.
                     if mask_heads == 1 and h_bias != 1:
-                        add = add.mean(dim=1, keepdim=True)
+                        attn_mask = attn_mask.expand(Bsz, h_bias, q_len, k_len)
                     elif mask_heads != h_bias:
                         add = add[:, :1]
                     new_mask = attn_mask + add
@@ -1098,6 +1200,7 @@ def process_kv_cache(
         _, num_heads0, _, _ = ks0.shape
         proto_frames_max = _resolve_proto_frames_max(prototrack_proto_frames, compress_frame_num, prototrack_pq_modes)
         state = _get_or_reset_prototrack_state(model, num_layers, num_heads0, proto_frames_max, device0, reset=bool(is_first_block))
+        rope_theta = _get_rope_theta_from_model(model)
         install_protokv_attention_bias_hook(model)
 
     for layer_idx in range(num_layers):
@@ -1157,6 +1260,7 @@ def process_kv_cache(
                 n_min=float(prototrack_min_mass),
                 cuda_timer=cuda_timer,
                 timing=timing if cuda_timer is None else None,
+                rope_theta=rope_theta,
             )
             state.proto_frames_cur[layer_idx] = int(p_final)
             if state.pq_codebooks_k is not None:
